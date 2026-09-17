@@ -70,6 +70,11 @@ export interface QqConfig {
   progress: ProgressMode;
   /** NapCat WebUI：用于「在 pi 里扫码登录 QQ」 */
   webui: QqWebuiConfig;
+  /**
+   * 「发『QQ登录』就默认换号」：踢掉当前登录的 QQ、清票据、重启 NapCat。
+   * 关掉它就恢复成老行为（已登录则直接复用）。
+   */
+  switchAccount: import("./channels/napcat-process.ts").SwitchAccountConfig;
 }
 
 export interface WechatConfig {
@@ -78,6 +83,14 @@ export interface WechatConfig {
   baseUrl: string;
   /** 白名单：iLink 用户 id（形如 xxx@im.wechat）。空 = 不响应任何人 */
   allowUsers: string[];
+  /**
+   * 「发『微信登录』= 换号」：先注销当前凭据（备份后清状态文件）再取新码。
+   *
+   * 为什么需要：微信侧的机器人身份是扫码时在腾讯云端新建的，凭据存在
+   * `wechat-session.json` 里。不清掉就只会重发同一张码，换不了号。
+   * 关掉它就恢复成老行为（仅重发当前二维码）。
+   */
+  switchAccount: boolean;
   /**
    * 微信官方条款：用户发消息后 24h 内最多 10 条主动消息（含回复）。
    * 因此默认关闭实时进度，只回最终结果。
@@ -224,11 +237,20 @@ export const DEFAULT_CONFIG: ImRelayConfig = {
         // NapCat 默认安装位置；存在就自动读取里面的 host/port/token
         configFile: "D:\\NapCat\\NapCat.Shell\\config\\webui.json",
       },
+      switchAccount: {
+        enabled: true,
+        shellDir: "D:/NapCat/NapCat.Shell",
+        qqDataDir: "",
+        backupDir: "",
+        restartDelayMs: 4000,
+        bootTimeoutMs: 60_000,
+      },
     },
     wechat: {
       enabled: false,
       baseUrl: "https://ilinkai.weixin.qq.com",
       allowUsers: [],
+      switchAccount: true,
       progress: "off",
     },
   },

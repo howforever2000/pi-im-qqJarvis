@@ -85,6 +85,34 @@ export default function imRelay(pi: ExtensionAPI): void {
 
   /* ------------------------- 生命周期 ------------------------- */
 
+  /**
+   * 任何 pi 事件都顺便确认「当前会话已经登记在 host 上」。
+   *
+   * 为什么必须要有这个：`session_start` 不是每次都会来 ——
+   * pi-web 浏览器端重连 / 扩展是在会话已经存在时才加载的 / 热重载的边界情况下，
+   * 都可能出现「会话活着但从未登记」，而 `session_shutdown` 又可能已经把旧登记注销了。
+   * 结果是 host.sessions 为空，IM 消息注入时报「没有活跃会话，无法接收 IM 消息」，
+   * 用户手机上只会收到一句失败提示。（这是实测撞到的真 bug，不是假想。）
+   */
+  const ensureSession = (ctx: ExtensionContext): RelayHost | undefined => {
+    const h = host();
+    if (!h) return undefined;
+    latestCtx = ctx;
+    let id: string;
+    try {
+      id = ctx.sessionManager.getSessionId();
+    } catch {
+      return h;
+    }
+    sessionId = id;
+    if (h.sessions.has(id)) return h;
+
+    cancelHostShutdown(h);
+    registerSession(h, { id, pi, ctx, updatedAt: Date.now(), label: describeLabel(ctx, pi) });
+    log.info(`补登记会话 ${id.slice(0, 8)}（它没在 host 里，多半是 UI 重连没触发 session_start）`);
+    return h;
+  };
+
   pi.on("session_start", async (_event, ctx) => {
     latestCtx = ctx;
     sessionId = ctx.sessionManager.getSessionId();
@@ -161,7 +189,7 @@ export default function imRelay(pi: ExtensionAPI): void {
   /* ------------------------- pi → IM 回传 ------------------------- */
 
   pi.on("message_end", async (event, ctx) => {
-    latestCtx = ctx;
+    ensureSession(ctx);
     if (event.message.role !== "assistant") return;
     const text = extractText(event.message.content);
     const stopReason = (event.message as { stopReason?: string }).stopReason;
@@ -169,12 +197,12 @@ export default function imRelay(pi: ExtensionAPI): void {
   });
 
   pi.on("tool_execution_start", async (event, ctx) => {
-    latestCtx = ctx;
+    ensureSession(ctx);
     host()?.router.onToolStart(event.toolName, event.args);
   });
 
   pi.on("agent_settled", async (_event, ctx) => {
-    latestCtx = ctx;
+    ensureSession(ctx);
     host()?.router.onSettled();
   });
 
@@ -189,7 +217,7 @@ export default function imRelay(pi: ExtensionAPI): void {
    * 不配合而失败。二维码会以 custom message 的形式直接出现在对话里。
    */
   pi.on("input", async (event, ctx) => {
-    latestCtx = ctx;
+    ensureSession(ctx);
     touch();
     if (event.source === "interactive") host()?.router.mirrorLocalInput(event.text);
     // extension 来源是本扩展自己注入的 IM 消息，不能让它反过来触发本机动作

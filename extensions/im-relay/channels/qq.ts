@@ -9,6 +9,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { createLogger, errorText } from "../log.ts";
 import { QQ_QR_FILE, type QqConfig } from "../config.ts";
+import { switchQqAccount } from "./napcat-process.ts";
 import { renderQr, type QrRender } from "../qr.ts";
 import {
   NapcatWebuiClient,
@@ -404,11 +405,48 @@ export class QqChannel implements Channel {
       throw new ChannelError(message);
     }
 
-    // 已经在 NapCat 里登录过了：不用扫码，直接恢复通道
+    // 已经在 NapCat 里登录过了。
+    // 默认行为是「换号」：踢掉旧账号、清票据、重启 NapCat，然后照常出二维码。
+    // 用户的要求就是「发出『QQ登录』就默认把之前那个踢下来」。
     if (status.coreReady) {
-      log.info("NapCat 已处于登录状态，跳过扫码直接连接 OneBot11");
-      await this.start();
-      return;
+      if (this.config.switchAccount?.enabled) {
+        this.setState("connecting", "正在踢掉当前登录的 QQ 并重启 NapCat …");
+        const outcome = await switchQqAccount(this.config.switchAccount, {
+          selfUin: this.selfId,
+          webuiHost: this.config.webui?.host || "127.0.0.1",
+          webuiPort: this.config.webui?.port || 6099,
+        });
+        log.info(`换号结果：${outcome.detail}`);
+        if (!outcome.ok) {
+          this.setState("error", outcome.detail);
+          throw new ChannelError(outcome.detail);
+        }
+        // NapCat 刚重启，WebUI 凭证与登录状态都要重新取一遍
+        this.loginController?.abort();
+        this.qr = undefined;
+        this.qrUrl = undefined;
+        this.selfId = "";
+        this.setState("connecting", "NapCat 已重启，正在申请新的登录二维码 …");
+        await this.start();
+        try {
+          status = await webui.status();
+        } catch (error) {
+          const message = describeWebuiFailure(error);
+          this.setState("error", message);
+          throw new ChannelError(message);
+        }
+        if (status.coreReady) {
+          // 极少见：账号又被自动登回去了（票据没清干净）。如实说明，不假装成功。
+          throw new ChannelError(
+            "NapCat 重启后旧账号仍然处于登录状态 —— 可能是登录票据没清干净。" +
+              "可先把 qq.switchAccount.enabled 关掉，或手动清一次 %APPDATA%\\QQ\\auth\\login.enc",
+          );
+        }
+      } else {
+        log.info("NapCat 已处于登录状态，跳过扫码直接连接 OneBot11（换号功能已关闭）");
+        await this.start();
+        return;
+      }
     }
 
     let url = status.qrcodeurl;

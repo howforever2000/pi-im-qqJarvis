@@ -21,6 +21,8 @@ import type { Channel, ChannelId, ChannelStatus, ChatTarget, InboundMessage } fr
 
 const log = createLogger("router");
 const PROGRESS_THROTTLE_MS = 5000;
+/** 注入失败（通常是暂时没有活跃会话）时最多重试几次，每 5 秒一次 */
+const MAX_INJECT_RETRIES = 6;
 
 export interface PiPort {
   /** pi 当前是否空闲（可以接受新的 prompt） */
@@ -52,6 +54,8 @@ export interface Job {
    * 能把这份上下文一起带过去。
    */
   notes?: string[];
+  /** 注入失败重试次数；超过上限才告诉用户失败 */
+  retries?: number;
 }
 
 /**
@@ -384,9 +388,22 @@ export class ImRelayRouter {
     try {
       this.deps.inject(`${header}${inbound.text}`, inbound.images);
     } catch (error) {
+      // 「没有活跃会话」往往是暂时的（UI 重连、扩展刚加载、会话登记丢了）。
+      // 直接报错会把用户的话弄丢 —— 实测就是这样：手机上发了一条需求，
+      // 只收到一句「把消息交给 pi 失败」，话本身没了。所以先重试几轮。
+      const retries = (job.retries ?? 0) + 1;
+      const message = errorText(error);
+      if (retries <= MAX_INJECT_RETRIES && !this.stopping) {
+        this.current = undefined;
+        this.queue.unshift({ ...job, retries });
+        log.warn(`注入 pi 失败，${retries}/${MAX_INJECT_RETRIES} 次，5 秒后重试：${message}`);
+        const timer = setTimeout(() => this.pump(), 5000);
+        timer.unref?.();
+        return;
+      }
       this.current = undefined;
-      log.error(`注入 pi 失败: ${errorText(error)}`);
-      void this.replyRaw(inbound.target, `把消息交给 pi 失败：${errorText(error)}`).catch(() => undefined);
+      log.error(`注入 pi 失败: ${message}`);
+      void this.replyRaw(inbound.target, `把消息交给 pi 失败：${message}`).catch(() => undefined);
       return;
     }
   }

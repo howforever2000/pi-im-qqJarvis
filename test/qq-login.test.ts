@@ -189,6 +189,10 @@ async function startFakeOneBot(): Promise<{ port: number; close: () => Promise<v
 
 function makeChannel(webui: FakeWebui, onebotPort = 59997, tokenOverride?: string) {
   const config = structuredClone(DEFAULT_CONFIG.channels.qq);
+  // 关掉「登录即换号」——它真的会 taskkill QQ.exe 并删登录票据。
+  // 单测绝不能真的去杀进程（会直接干掉开发者本地正在跑的 NapCat）。
+  // 换号逻辑自己的用例在 test/features.test.ts 里单独测，且不碰真进程。
+  config.switchAccount.enabled = false;
   config.host = "127.0.0.1";
   config.port = onebotPort;
   config.webui.enabled = true;

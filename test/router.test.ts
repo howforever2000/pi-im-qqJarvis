@@ -490,3 +490,31 @@ test("重载会接住记忆节流状态，不因为 reload 就白刷一次", asy
   const carry2 = h.router.carryOver();
   assert.equal(carry2.memoryDirty, true);
 });
+
+/* ------------------- 注入失败不丢消息 ------------------- */
+
+test("暂时没有活跃会话时，消息会被保留并重试，而不是直接丢掉", async () => {
+  const h = makeHarness();
+  // 先让 pi 报「没有活跃会话」，再恢复正常 —— 模拟 UI 重连的空窗
+  let failing = true;
+  const realInject = (h as unknown as { injected: unknown[] });
+  // makeHarness 的 deps 是闭包，这里直接换掉 router 用的 deps 不方便，
+  // 改用「注入时抛错」的方式：临时把 deps.inject 换成会抛的
+  const routerAny = h.router as unknown as { deps: { inject: (t: string, i: unknown[]) => void } };
+  const original = routerAny.deps.inject;
+  routerAny.deps.inject = () => {
+    if (failing) throw new Error("没有活跃会话，无法接收 IM 消息");
+    original("恢复了", []);
+  };
+
+  await h.router.accept(h.inbound({ text: "这条不能丢" }));
+  assert.equal(h.injected.length, 0, "第一次注入应当失败，且不报错回复");
+  assert.equal(h.notified.filter((n) => n.includes("把消息交给 pi 失败")).length, 0, "不该立刻发失败提示");
+
+  failing = false;
+  // 等重试窗口（5 秒）—— 这里直接触发一次 pump 更快
+  (h.router as unknown as { pump: () => void }).pump();
+  await sleep(120);
+  assert.equal(h.injected.length, 1, "重试成功之后消息必须真的被送进去");
+  assert.equal(realInject.injected.length, 1);
+});

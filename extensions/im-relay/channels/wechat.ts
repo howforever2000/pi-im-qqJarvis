@@ -192,6 +192,35 @@ export class WechatChannel implements Channel {
     }
   }
 
+  /**
+   * 注销当前微信凭据。
+   *
+   * 状态文件会先备份（`.logout-<时间戳>`）再清空 —— 用户明确要求过
+   * 「动既有资料前先备份」，而这份文件里装的是登录凭据，丢了就只能重新扫码。
+   */
+  async logout(reason: string): Promise<void> {
+    const had = Boolean(this.state.credential?.token);
+    try {
+      if (fs.existsSync(WECHAT_SESSION_FILE)) {
+        const backup = `${WECHAT_SESSION_FILE}.logout-${Date.now()}`;
+        fs.copyFileSync(WECHAT_SESSION_FILE, backup);
+        log.info(`微信凭据已备份：${backup}`);
+      }
+    } catch (error) {
+      log.warn(`备份微信凭据失败（继续注销）：${errorText(error)}`);
+    }
+
+    this.loginController?.abort();
+    this.loginController = undefined;
+    this.state.credential = null;
+    this.state.contextTokens = {};
+    this.saveState();
+    this.qr = undefined;
+    this.qrUrl = undefined;
+    this.setState("needs-login", `已注销微信登录（${reason}），等待重新扫码`);
+    log.info(`已注销微信登录：${reason}${had ? "" : "（本来就没有凭据）"}`);
+  }
+
   /* ---------------------------- 扫码登录 ---------------------------- */
 
   /**
@@ -211,6 +240,12 @@ export class WechatChannel implements Channel {
       log.info("已有进行中的登录二维码，直接复用（不重复申请）");
       this.reissueQr();
       return;
+    }
+
+    // 「发『微信登录』= 换号」：先把当前凭据注销掉，否则申请回来的还是同一个身份，
+    // 用户会以为换号没生效。备份后再清，且失败不影响发起登录。
+    if (this.config.switchAccount && this.state.credential?.token) {
+      await this.logout("用户重新发起了微信登录");
     }
 
     this.loginController?.abort();

@@ -408,3 +408,73 @@ test("resetMemoryCache 之后会真的重新读一次（新会话/刚登录的�
     restore();
   }
 });
+
+/* ---------------------- 登录即换号（不碰真进程） ---------------------- */
+
+// 让换号逻辑全程干跑：这个模块会真的 taskkill QQ.exe，单测绝不能执行它
+process.env.PI_IM_RELAY_NO_PROCESS_CONTROL = "1";
+
+const { switchQqAccount, backupAndRemove, probePort, DEFAULT_SWITCH_ACCOUNT } = await import(
+  "../extensions/im-relay/channels/napcat-process.ts"
+);
+
+test("换号被关掉时不再碰任何东西（尊重 qq.switchAccount.enabled=false）", async () => {
+  const out = await switchQqAccount(
+    { ...DEFAULT_SWITCH_ACCOUNT, enabled: false },
+    { selfUin: "10001", webuiHost: "127.0.0.1", webuiPort: 1 },
+  );
+  assert.equal(out.ok, false);
+  assert.match(out.detail, /已关闭/);
+  assert.deepEqual(out.cleared, []);
+});
+
+test("备份并清除：先备份再删，且只动指定路径", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "switch-src-"));
+  const backupRoot = fs.mkdtempSync(path.join(os.tmpdir(), "switch-bak-"));
+  const a = path.join(root, "auth", "login.enc");
+  const b = path.join(root, "Partitions", "qqnt_10001");
+  const keep = path.join(root, "Partitions", "qqnt_9210");
+  fs.mkdirSync(path.dirname(a), { recursive: true });
+  fs.mkdirSync(b, { recursive: true });
+  fs.mkdirSync(keep, { recursive: true });
+  fs.writeFileSync(a, "ticket");
+  fs.writeFileSync(path.join(b, "x"), "data");
+  fs.writeFileSync(path.join(keep, "y"), "共享分区，绝不能动");
+
+  const { cleared, backupDir } = backupAndRemove(
+    [
+      { abs: a, label: "QQ/auth/login.enc" },
+      { abs: b, label: "QQ/Partitions/qqnt_10001" },
+    ],
+    backupRoot,
+  );
+
+  assert.deepEqual(cleared.sort(), ["QQ/Partitions/qqnt_10001", "QQ/auth/login.enc"]);
+  assert.ok(backupDir, "应当产生备份目录");
+  assert.ok(!fs.existsSync(a), "票据应当被清掉");
+  assert.ok(!fs.existsSync(b), "旧账号分区应当被清掉");
+  assert.ok(fs.existsSync(keep), "共享分区绝不能被碰");
+  // 备份里应当能找到原件
+  assert.equal(fs.readFileSync(path.join(backupDir!, "QQ__auth__login.enc"), "utf8"), "ticket");
+});
+
+test("要清的目标都不存在时，不该凭空建备份目录", () => {
+  const backupRoot = fs.mkdtempSync(path.join(os.tmpdir(), "switch-bak2-"));
+  const out = backupAndRemove([{ abs: path.join(backupRoot, "nope"), label: "nope" }], backupRoot);
+  assert.deepEqual(out.cleared, []);
+  assert.equal(out.backupDir, undefined);
+});
+
+test("probePort 能区分「有服务」与「没服务」", async () => {
+  const net = await import("node:net");
+  const server = net.createServer();
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+  const port = (server.address() as { port: number }).port;
+  try {
+    assert.equal(await probePort("127.0.0.1", port), true);
+  } finally {
+    server.close();
+  }
+  // 关掉之后应当探测失败（拿一个刚释放的高位端口，避免撞上别的服务）
+  assert.equal(await probePort("127.0.0.1", 1, 500), false);
+});
