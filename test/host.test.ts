@@ -26,6 +26,7 @@ fs.writeFileSync(
 const hostModule = await import("../extensions/im-relay/host.ts");
 const { ensureHost, getHost, clearHost, registerSession, unregisterSession, touchSession, setActive, activeBinding, scheduleHostShutdown, cancelHostShutdown } = hostModule;
 const { acquireProcessLock, releaseProcessLock, readLock, describeHolder } = await import("../extensions/im-relay/lock.ts");
+const { stopConfigWatch } = await import("../extensions/im-relay/watch.ts");
 
 function makeFakePi() {
   return {
@@ -72,10 +73,29 @@ function resetHost(): void {
   const h = getHost();
   if (h) {
     if (h.shutdownTimer) clearTimeout(h.shutdownTimer);
+    // host 上的配置热加载监听要一并关掉，否则跨用例漏一个 watcher
+    stopConfigWatch(h);
     if (h.lock.ok) releaseProcessLock(h.lock.file);
   }
   clearHost();
 }
+
+test("ensureHost 会装上配置监听；复用时不会重复装", async () => {
+  resetHost();
+  const pi = makeFakePi();
+  const a = makeFakeCtx("session-a");
+  const b = makeFakeCtx("session-b");
+
+  const hostA = await ensureHost(pi, a.ctx);
+  const watcher = hostA.configWatcher;
+  assert.ok(watcher, "首次启动应当装上 config.json 监听（热加载的前提）");
+
+  // 模拟 /reload：新代码拿到的是同一个 host，应当补装而不是重装
+  const hostB = await ensureHost(pi, b.ctx);
+  assert.equal(hostB, hostA);
+  assert.equal(hostB.configWatcher, watcher, "复用 host 时不应重新创建监听器");
+  resetHost();
+});
 
 test("同一进程内多个会话共享同一个 host，通道只启动一次", async () => {
   resetHost();

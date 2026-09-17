@@ -24,6 +24,7 @@ import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CONFIG_FILE, DATA_DIR, LOG_FILE } from "./config.ts";
 import { closeLog, createLogger, errorText } from "./log.ts";
+import { renderPdf } from "./pdf.ts";
 import {
   ensureHost,
   getHost,
@@ -378,6 +379,81 @@ export default function imRelay(pi: ExtensionAPI): void {
       }
       log.info(`已发送文件 ${filePath}（${formatBytes(stat.size)}）→ ${target.label}`);
       return text(`已把 ${path.basename(filePath)}（${formatBytes(stat.size)}）发到 ${target.label}。`);
+    },
+  });
+
+  pi.registerTool({
+    name: "im_relay_send_pdf",
+    label: "把长文渲染成 PDF 并发回 IM",
+    description:
+      "把一段 Markdown（或一个已有的 .md/.txt 文件）渲染成排版好的 PDF，作为附件发回当前 IM 会话。" +
+      "用在「结论很长、或者含表格，在手机聊天窗口里没法看」的场合：聊天里只留一段简短说明，正文走 PDF。" +
+      "支持标题、段落、粗斜体、行内代码、围栏代码块、表格、有序/无序列表、引用块。" +
+      "只能发回最近跟本机说过话的那个 IM 会话；微信通道不支持发文件会明确报错。",
+    promptSnippet: "把长文/Markdown 渲染成 PDF 并作为附件发回当前 IM 会话",
+    promptGuidelines: [
+      "多段的结构化结论（改造报告、排查结论、方案对比）优先用 im_relay_send_pdf 发 PDF，不要在聊天里堆长文；一两句话能说清的直接回文字。",
+      "渲染失败时把错误原文告诉用户，并说明正文已在本机哪个文件里，不要静默吞掉。",
+    ],
+    parameters: Type.Object({
+      title: Type.String({ description: "文档标题，会显示在 PDF 首页" }),
+      markdown: Type.Optional(Type.String({ description: "Markdown 正文；与 filePath 二选一" })),
+      filePath: Type.Optional(
+        Type.String({ description: "已有的 .md / .txt 文件绝对路径；与 markdown 二选一" }),
+      ),
+      fileName: Type.Optional(Type.String({ description: "PDF 文件名（不含扩展名），默认用标题" })),
+      channel: Type.Optional(
+        Type.Union([Type.Literal("qq"), Type.Literal("wechat")], {
+          description: "发到哪个通道，默认回给刚跟你说话的那个会话",
+        }),
+      ),
+    }),
+    async execute(_toolCallId, params) {
+      const text = (s: string) => ({ content: [{ type: "text" as const, text: s }], details: {} });
+      const h = host();
+      if (!h) return text("pi-im-relay 未启动（本会话里扩展没有加载）。");
+      if (!h.config.pdf.enabled) return text("PDF 出站在配置里被关闭了（config.json 的 pdf.enabled）。");
+
+      let markdown = params.markdown ?? "";
+      if (!markdown && params.filePath) {
+        try {
+          markdown = fs.readFileSync(path.resolve(params.filePath), "utf8");
+        } catch (error) {
+          return text(`读不到源文件：${errorText(error)}`);
+        }
+      }
+      if (!markdown.trim()) return text("正文是空的：markdown 与 filePath 至少要给一个。");
+
+      const target = h.router.replyTarget(params.channel);
+      if (!target) {
+        return text(
+          "没有可回复的 IM 会话：先让对方从 QQ / 微信 发一条消息过来，我才能把文件回过去。",
+        );
+      }
+      const channel = h.router.channel(target.channel);
+      if (!channel) return text(`通道 ${target.channel} 未注册。`);
+      if (!channel.sendFile) {
+        return text(`${channel.name} 通道不支持发文件（微信侧只做了出站文本）。`);
+      }
+
+      const safeName = (params.fileName ?? params.title ?? "report").replace(/[\\/:*?"<>|]/g, "_").slice(0, 60);
+      const workDir = path.join(DATA_DIR, "tmp", "pdf");
+      const output = path.join(workDir, `${safeName}.pdf`);
+
+      try {
+        renderPdf(markdown, { title: params.title, output, workDir, browser: h.config.pdf.browser });
+      } catch (error) {
+        return text(`PDF 渲染失败：${errorText(error)}`);
+      }
+
+      try {
+        await channel.sendFile(target, output);
+      } catch (error) {
+        return text(`PDF 已生成（${output}），但发送失败：${errorText(error)}`);
+      }
+      const size = fs.statSync(output).size;
+      log.info(`已发送 PDF ${output}（${formatBytes(size)}）→ ${target.label}`);
+      return text(`已把《${params.title}》（${formatBytes(size)}）作为 PDF 发到 ${target.label}。本机路径：${output}`);
     },
   });
 

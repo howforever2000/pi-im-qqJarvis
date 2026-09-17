@@ -14,6 +14,8 @@
 import { createLogger, errorText } from "./log.ts";
 import { ChatMapStore } from "./store.ts";
 import { DedupeSet, RateLimiter, humanAge } from "./text.ts";
+import { saveInboundImages } from "./album.ts";
+import { buildMemory } from "./memory.ts";
 import type { ImRelayConfig } from "./config.ts";
 import type { Channel, ChannelId, ChannelStatus, ChatTarget, InboundMessage } from "./channels/types.ts";
 
@@ -41,9 +43,35 @@ export interface PiPort {
   onChannelStatus(all: ChannelStatus[]): void;
 }
 
-interface Job {
+export interface Job {
   inbound: InboundMessage;
   queuedAt: number;
+  /**
+   * 垫在用户消息前面的附加信息（相册回执、工作约定、主页记忆…）。
+   * 在**入队时**就组装好：一是避免重复做同样的活，二是让「重载时队列接力」
+   * 能把这份上下文一起带过去。
+   */
+  notes?: string[];
+}
+
+/**
+ * 重建通道时要带过去的状态。
+ *
+ * 不带不行：热加载（和 `/im reload`）会 new 一个 router，而「正在处理的那条消息」
+ * 是挂在 router 实例上的。如果重载恰好发生在某一轮处理中间，新的 router 里
+ * `current` 是空的，`onSettled()` 就什么也不做 —— 用户看到的现象是
+ * 「发了消息，agent 跑了半天，一个字都没回」。
+ *
+ * 队列同理：重载时排队中的消息不能直接丢掉。
+ */
+export interface RouterCarry {
+  current?: Job;
+  queue: Job[];
+  lastTarget?: ChatTarget;
+  lastTargets: Array<[ChannelId, ChatTarget]>;
+  lastAssistantText?: string;
+  lastStopReason?: string;
+  toolCount: number;
 }
 
 export class ImRelayRouter {
@@ -130,6 +158,34 @@ export class ImRelayRouter {
     return this.lastTargets.get(channel);
   }
 
+  /**
+   * 导出可跨越重载保留的状态。见 `RouterCarry` 的说明：
+   * 不搬这一份，「重载恰好发生在某轮处理中间」就会把结果静默丢掉。
+   */
+  carryOver(): RouterCarry {
+    return {
+      current: this.current,
+      queue: [...this.queue],
+      lastTarget: this.lastTarget,
+      lastTargets: [...this.lastTargets.entries()],
+      lastAssistantText: this.lastAssistantText,
+      lastStopReason: this.lastStopReason,
+      toolCount: this.toolCount,
+    };
+  }
+
+  /** 把上一个 router 的状态接过来（重建通道 / 热加载时用）。 */
+  adopt(carry: RouterCarry): void {
+    this.current = carry.current;
+    this.queue.push(...carry.queue);
+    this.lastTarget = carry.lastTarget;
+    this.lastTargets.clear();
+    for (const [id, target] of carry.lastTargets) this.lastTargets.set(id, target);
+    this.lastAssistantText = carry.lastAssistantText;
+    this.lastStopReason = carry.lastStopReason;
+    this.toolCount = carry.toolCount;
+  }
+
   /** 由通道回调：状态变化。 */
   handleChannelStatus(status: ChannelStatus): void {
     this.statuses.set(status.id, status);
@@ -193,8 +249,54 @@ export class ImRelayRouter {
       const dropped = this.queue.shift();
       if (dropped) log.warn(`队列已满，丢弃最旧消息（${dropped.inbound.label}）`);
     }
-    this.queue.push({ inbound, queuedAt: Date.now() });
+
+    // 组装要垫在消息前面的上下文：相册回执（同步）+ 工作约定与主页记忆（异步、带缓存）
+    const notes = await this.buildNotes(inbound);
+    this.queue.push({ inbound, queuedAt: Date.now(), notes });
     this.pump();
+  }
+
+  /**
+   * 拼「消息之前的垫话」。任何一步失败都只跳过那一步 ——
+   * 存相册、读记忆都是附赠能力，不能因为它们把用户消息本身弄丢。
+   */
+  private async buildNotes(inbound: InboundMessage): Promise<string[]> {
+    const notes: string[] = [];
+
+    if (inbound.images.length > 0 && this.config.album.enabled) {
+      try {
+        const saved = saveInboundImages(inbound.images, this.config.album, new Date(inbound.receivedAt));
+        for (const s of saved) {
+          if (!this.config.album.announce) continue;
+          notes.push(
+            s.duplicate
+              ? `[相册] 这张图之前已存过，直接复用：${s.file}`
+              : `[相册] 已保存：${s.file}（${(s.bytes / 1024).toFixed(1)} KB）`,
+          );
+        }
+      } catch (error) {
+        log.warn(`相册处理失败（已跳过）：${errorText(error)}`);
+      }
+    }
+
+    if (this.config.memory.enabled) {
+      const channel = this.channels.get(inbound.channel);
+      const raw = channel?.api;
+      if (raw) {
+        try {
+          const memory = await buildMemory(
+            (action, params) => raw.call(channel, action, params),
+            this.config.memory,
+            String(inbound.channel),
+          );
+          if (memory.text) notes.push(memory.text);
+        } catch (error) {
+          log.warn(`记忆组装失败（已跳过）：${errorText(error)}`);
+        }
+      }
+    }
+
+    return notes;
   }
 
   private isWhitelisted(inbound: InboundMessage): boolean {
@@ -228,7 +330,7 @@ export class ImRelayRouter {
     this.lastProgressAt = 0;
 
     const { inbound } = job;
-    const header = this.buildHeader(inbound);
+    const header = this.buildHeader(job);
     log.info(`提交给 pi：${inbound.label}`);
     try {
       this.deps.inject(`${header}${inbound.text}`, inbound.images);
@@ -240,10 +342,15 @@ export class ImRelayRouter {
     }
   }
 
-  /** 让模型知道消息来自哪个 IM 会话，多来源时不会串味。 */
-  private buildHeader(inbound: InboundMessage): string {
+  /** 让模型知道消息来自哪个 IM 会话，多来源时不会串味；垫话放在最前面。 */
+  private buildHeader(job: Job): string {
+    const inbound = job.inbound;
     const who = inbound.isGroup ? `群 ${inbound.groupId} 里的 ${inbound.senderName}` : inbound.senderName;
-    const lines = [`[来自${inbound.channel === "qq" ? "QQ" : "微信"} · ${who} · ${formatClock(inbound.receivedAt)}]`];
+    const lines: string[] = [];
+
+    if (job.notes?.length) lines.push(...job.notes, "");
+
+    lines.push(`[来自${inbound.channel === "qq" ? "QQ" : "微信"} · ${who} · ${formatClock(inbound.receivedAt)}]`);
     if (this.config.mirrorLocalInput === false && this.currentJobCount() > 1) {
       lines.push("[注意：当前还有其它 IM 会话在排队，请只回应本条消息]");
     }

@@ -342,3 +342,64 @@ test("空答复时给出兜底文案", async () => {
   await h.settle("");
   assert.ok(h.channel.sent.some((s) => s.text.includes("没有产生文字回复")));
 });
+
+/* --------------------- 热加载/重载的状态接力 --------------------- */
+
+test("重载恰好撞上某轮处理中间时，这一轮的结果不会丢", async () => {
+  const h = makeHarness();
+  await h.router.accept(h.inbound({ text: "帮我做件慢事" }));
+  assert.equal(h.injected.length, 1, "消息应当已经交给 pi");
+
+  // 模拟热加载：导出状态 → 建新 router → 接过去
+  const carry = h.router.carryOver();
+  const next = new ImRelayRouter(
+    structuredClone(DEFAULT_CONFIG),
+    // 复用同一套 deps 不方便，这里只关心「结果回给谁」，用最小替身
+    {
+      isIdle: () => true,
+      inject: () => {},
+      dispatchCommand: () => {},
+      abort: () => {},
+      describeSession: () => "",
+      switchModel: async () => "",
+      listModels: () => [],
+      notify: () => {},
+      onChannelStatus: () => {},
+    },
+    new ChatMapStore(path.join(os.tmpdir(), `im-relay-test-carry-${Date.now()}.json`)),
+  );
+  next.adopt(carry);
+
+  const sent: Array<{ target: ChatTarget; text: string }> = [];
+  next.registerChannel({
+    id: "qq",
+    name: "FakeQQ2",
+    start: async () => {},
+    stop: async () => {},
+    status: () => ({ id: "qq", name: "FakeQQ2", state: "online" }),
+    send: async (target, text) => {
+      sent.push({ target, text });
+    },
+  });
+
+  next.onAssistantText("活儿干完了", "stop");
+  next.onSettled();
+  await sleep(120);
+
+  assert.equal(sent.length, 1, "重载后这一轮的结果必须还能发出去（不能静默丢）");
+  assert.ok(sent[0]?.text.includes("活儿干完了"), `实际内容：${sent[0]?.text}`);
+  assert.equal(sent[0]?.target.route?.userId, "1001", "应当回给原来那条消息的发起者");
+});
+
+test("carryOver 也会把排队中的消息带过去", async () => {
+  const h = makeHarness();
+  await h.router.accept(h.inbound({ text: "第一条" }));
+  // 第一条占住 current，第二条进队列
+  await h.router.accept(h.inbound({ text: "第二条" }));
+
+  const carry = h.router.carryOver();
+  assert.equal(carry.current?.inbound.text, "第一条");
+  assert.equal(carry.queue.length, 1, "排队中的消息应当被带过去而不是丢掉");
+  assert.equal(carry.queue[0]?.inbound.text, "第二条");
+  assert.equal(carry.lastTargets.length, 1, "最近可回复目标也要带走");
+});

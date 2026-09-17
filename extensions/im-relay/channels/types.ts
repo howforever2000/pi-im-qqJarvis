@@ -114,6 +114,14 @@ export interface Channel {
   waitForLogin?(): Promise<void>;
   /** 重发当前二维码（不申请新的）；返回是否成功。 */
   reissueQr?(): boolean;
+  /**
+   * 直接调底层协议接口（QQ 就是 OneBot11 action）。
+   *
+   * 存在的意义：有些能力在 OneBot 层有，但通道自己没有包装成方法 ——
+   * 典型就是「读 QQ 空间」要用的 `get_cookies`。放着不用就得把协议细节
+   * 搬到 router 里，那才是真的脏。
+   */
+  api?<T = unknown>(action: string, params?: Record<string, unknown>, timeoutMs?: number): Promise<T>;
 }
 
 export class ChannelError extends Error {

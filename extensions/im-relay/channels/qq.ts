@@ -82,6 +82,12 @@ export class QqChannel implements Channel {
     this.maxReplyChars = maxReplyChars;
   }
 
+  /** 直接透到 OneBot11 —— 读 QQ 空间要用的 `get_cookies` 就走这里。 */
+  api<T = unknown>(action: string, params?: Record<string, unknown>, timeoutMs = 30_000): Promise<T> {
+    if (!this.client) return Promise.reject(new Error("QQ 通道尚未连接 NapCat"));
+    return this.client.api<T>(action, params, timeoutMs);
+  }
+
   status(): ChannelStatus {
     return {
       id: this.id,

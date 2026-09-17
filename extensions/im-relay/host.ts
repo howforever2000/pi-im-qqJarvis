@@ -24,6 +24,7 @@ import { ImRelayRouter } from "./router.ts";
 import { QqChannel } from "./channels/qq.ts";
 import { WechatChannel } from "./channels/wechat.ts";
 import { DATA_DIR, loadConfig, saveConfig, type ImRelayConfig } from "./config.ts";
+import { startConfigWatch, stopConfigWatch, syncConfigWatch } from "./watch.ts";
 import type { ChannelStatus, QrPayload } from "./channels/types.ts";
 import { deliverLoginQr as deliverLoginQrTo, deliverLoginQrFallback as deliverLoginQrFallbackTo, type LoginUiPort } from "./login-ui.ts";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -62,6 +63,12 @@ export interface RelayHost {
   lastQr?: { channel: string; qr: QrPayload };
   /** 最后一个会话关闭后的延迟拆机定时器 */
   shutdownTimer?: NodeJS.Timeout;
+  /** config.json 热加载：目录监听句柄 */
+  configWatcher?: import("node:fs").FSWatcher;
+  /** config.json 热加载：去抖定时器 */
+  configWatchTimer?: NodeJS.Timeout;
+  /** config.json 热加载：上一次已知内容的哈希 */
+  configWatchHash?: string;
 }
 
 const HOST_SLOT = "__piImRelayHost";
@@ -83,7 +90,10 @@ export function clearHost(): void {
  */
 export async function ensureHost(pi: ExtensionAPI, ctx: ExtensionContext): Promise<RelayHost> {
   const existing = getHost();
-  if (existing) return existing;
+  if (existing) {
+    ensureConfigWatch(existing);
+    return existing;
+  }
 
   const { config } = loadConfig();
   const chatMap = new ChatMapStore();
@@ -126,7 +136,22 @@ export async function ensureHost(pi: ExtensionAPI, ctx: ExtensionContext): Promi
     log.warn(`通道未启动：${describeHolder(lock.holder)} 已占用。请在那边操作，或关掉那个 pi 再重启本进程。`);
   }
 
+  // 配置热加载：改了 config.json 就自动 reload，不用再手敲 /im reload
+  ensureConfigWatch(host);
+
   return host;
+}
+
+/**
+ * 只在还没监听时才装上配置监听。
+ *
+ * 为什么不是无条件调用：`/reload` 会换掉扩展代码，但**故意保留**同一个 host
+ * （不然通道会白抖一下）。所以新代码里的 `ensureHost()` 会拿到一个由**旧代码**
+ * 建立、身上没有任何监听器的 host —— 这里补上，热加载才能对「已经跑着的 host」生效。
+ */
+function ensureConfigWatch(host: RelayHost): void {
+  if (host.configWatcher || host.configWatchTimer) return;
+  startConfigWatch(host, reloadHost);
 }
 
 /** 会话登记。返回 host，方便调用方继续用。 */
@@ -474,8 +499,11 @@ export function cancelHostShutdown(host: RelayHost): void {
   host.shutdownTimer = undefined;
 }
 
-/** 供 /im reload 使用：换掉配置并重建通道。 */
+/** 供 /im reload 和热加载使用：换掉配置并重建通道。 */
 export async function reloadHost(host: RelayHost): Promise<void> {
+  // 先把「正在处理的那条消息」和最近的可回复目标接过来。
+  // 不接的话，重载恰好撞上某轮处理中间时会静默吞掉那一轮的结果。
+  const carry = host.router.carryOver();
   await host.router.stop().catch(() => undefined);
   const { config } = loadConfig();
   host.config = config;
@@ -484,6 +512,7 @@ export async function reloadHost(host: RelayHost): Promise<void> {
   chatMap.load();
   host.chatMap = chatMap;
   const router = new ImRelayRouter(config, makePort(), chatMap);
+  router.adopt(carry);
   router.promptUser = async (question: string) => {
     const binding = activeBinding(host);
     if (!binding?.ctx.hasUI) return undefined;
@@ -495,10 +524,13 @@ export async function reloadHost(host: RelayHost): Promise<void> {
     await router.start();
     host.channelsRunning = true;
   }
+  // 重载完成后对齐基线，避免刚重载完又被自己的写入触发一次循环
+  syncConfigWatch(host);
   pushStatus(host);
 }
 
 export function shutdownHost(host: RelayHost): void {
+  stopConfigWatch(host);
   host.chatMap.dispose();
   if (host.lock.ok) releaseProcessLock(host.lock.file);
   clearHost();
@@ -506,6 +538,8 @@ export function shutdownHost(host: RelayHost): void {
 
 export function saveHostConfig(host: RelayHost): void {
   saveConfig(host.config);
+  // 自己写的配置，对齐基线：不该触发一次热加载
+  syncConfigWatch(host);
 }
 
 export type { ChannelStatus, LockResult };

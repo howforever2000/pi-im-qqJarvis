@@ -27,6 +27,10 @@ export const WECHAT_SESSION_FILE = join(STATE_DIR, "wechat-session.json");
 export const CHAT_MAP_FILE = join(STATE_DIR, "chat-map.json");
 /** QQ 登录二维码的文本兜底（图片投递不可用时用链接） */
 export const QQ_QR_FILE = join(STATE_DIR, "qq-login-qrcode.txt");
+/** 人可读的“工作约定”，每条消息前注入给模型；用户可直接编辑 */
+export const AGENT_MD_FILE = join(DATA_DIR, "AGENT.md");
+/** 空间内容缓存（避免每条消息都打一次网络） */
+export const QZONE_CACHE_FILE = join(STATE_DIR, "qzone-cache.json");
 
 /**
  * NapCat WebUI 的连接参数。
@@ -81,6 +85,57 @@ export interface WechatConfig {
   progress: ProgressMode;
 }
 
+/**
+ * 相册：收到的图片落到本机目录。
+ *
+ * 为什么放在扩展里而不是靠 agent 临场处理：agent 的"记住这个约定"会随着上下文
+ * 压缩而丢失，而"用户发的图去哪了"是不能丢的事。
+ */
+export interface AlbumConfig {
+  enabled: boolean;
+  /** 目标目录（相册） */
+  dir: string;
+  /** 文件名模板，支持 {yyyy} {MM} {dd} {HH} {mm} {ss} 与 {n}（同秒序号） */
+  namePattern: string;
+  /** 回执：存好后在注入给模型的消息头部加一行已存路径 */
+  announce: boolean;
+  /** 同一张图（按内容哈希）反复发时是否只存一份 */
+  dedupe: boolean;
+}
+
+/**
+ * 记忆：工作前先读一份"我是谁 / 我们约好了什么"，避免 agent 失忆。
+ *
+ * 两个来源：
+ *   1. 本机 AGENT.md —— 用户可手改的硬约定
+ *   2. QQ空间的说说 —— 最近 N 条 + 历史抽样 M 条；其中以 identityMarker 开头的那条
+ *      视为"身份定位 prompt"。
+ * 不用置顶是因为 QQ 空间的 settop 接口在本项目实测不可用（HTTP 500），而且
+ * 列表接口也不返回任何"是否置顶"字段，读了也认不出来。
+ */
+export interface MemoryConfig {
+  enabled: boolean;
+  /** 注入给模型的总长度上限（字符），超出截断 */
+  maxChars: number;
+  /** 读空间的最近条数 */
+  recent: number;
+  /** 读空间的历史抽样条数（从最旧的开始取） */
+  sample: number;
+  /** 空间内容缓存秒数，避免每条消息都打一次网络 */
+  cacheSeconds: number;
+  /** 身份定位说说的开头标记 */
+  identityMarker: string;
+}
+
+/** 长文转 PDF 出站。 */
+export interface PdfConfig {
+  enabled: boolean;
+  /** 正文超过这个字数就建议改走 PDF（写进工具说明，由 agent 判断） */
+  threshold: number;
+  /** Chrome/Edge 可执行文件；留空则按内置候选列表自动探测 */
+  browser: string;
+}
+
 export interface ImRelayConfig {
   /** 总开关；可用 /im-relay off 临时关闭 */
   enabled: boolean;
@@ -94,6 +149,9 @@ export interface ImRelayConfig {
   announceUnpaired: boolean;
   /** 是否把本体终端里输入的 prompt 也同步到 IM（镜像模式） */
   mirrorLocalInput: boolean;
+  album: AlbumConfig;
+  memory: MemoryConfig;
+  pdf: PdfConfig;
   channels: {
     qq: QqConfig;
     wechat: WechatConfig;
@@ -107,6 +165,26 @@ export const DEFAULT_CONFIG: ImRelayConfig = {
   rateLimitPerMinute: 20,
   announceUnpaired: true,
   mirrorLocalInput: false,
+  album: {
+    enabled: true,
+    dir: "D:\\YUAN HAO\\Pictures\\手机上传",
+    namePattern: "QQ_{yyyy}{MM}{dd}_{HH}{mm}{ss}",
+    announce: true,
+    dedupe: true,
+  },
+  memory: {
+    enabled: true,
+    maxChars: 2000,
+    recent: 5,
+    sample: 5,
+    cacheSeconds: 300,
+    identityMarker: "[身份]",
+  },
+  pdf: {
+    enabled: true,
+    threshold: 300,
+    browser: "",
+  },
   channels: {
     qq: {
       enabled: true,
