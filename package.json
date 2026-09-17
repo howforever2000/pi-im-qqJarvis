@@ -55,7 +55,11 @@
   "private": false,
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/<your-account>/pi-im-relay.git"
+    "url": "git+https://github.com/howforever2000/pi-im-qqJarvis.git"
   },
-  "author": "hao <howforever2000@163.com>"
+  "author": "hao <howforever2000@163.com>",
+  "homepage": "https://github.com/howforever2000/pi-im-qqJarvis",
+  "bugs": {
+    "url": "https://github.com/howforever2000/pi-im-qqJarvis/issues"
+  }
 }
