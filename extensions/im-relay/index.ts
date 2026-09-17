@@ -227,7 +227,7 @@ export default function imRelay(pi: ExtensionAPI): void {
       };
     }
     if (!channel.login) {
-      return { ok: false, error: `${channel.name} 的登录由 NapCat 客户端负责，请在 NapCat 里扫码` };
+      return { ok: false, error: `${channel.name} 通道不支持从这里发起登录` };
     }
     if (channel.status().state === "online") {
       return { ok: false, error: `${channel.name} 已经是登录状态，不需要重新登录` };
@@ -276,14 +276,14 @@ export default function imRelay(pi: ExtensionAPI): void {
     name: "im_relay_login",
     label: "登录 IM 通道",
     description:
-      "发起 QQ 或 微信 的登录绑定流程。微信登录会生成一张二维码图片并自动发到当前对话里，用户用手机扫码确认即可；QQ 的登录由 NapCat 客户端负责，本工具只会提示去 NapCat 扫码。当用户说「登录微信/绑定微信/连上微信/登录QQ」，或 IM 通道处于 needs-login 状态时调用。",
-    promptSnippet: "发起 QQ / 微信登录绑定（微信二维码会自动发到对话里）",
+      "发起 QQ 或 微信 的登录绑定流程。两个通道都会生成一张二维码图片并自动发到当前对话里，用户用手机扫码确认即可（QQ 二维码由 NapCat WebUI 提供，扩展自动投递）。当用户说「登录微信/绑定微信/连上微信/登录QQ/QQ登录」，或 IM 通道处于 needs-login 状态时调用。",
+    promptSnippet: "发起 QQ / 微信登录绑定（二维码会自动发到对话里）",
     promptGuidelines: [
       "调用 im_relay_login 后，不要再重复把二维码链接或说明贴一遍：二维码图片已经由扩展自动发到对话里了。",
     ],
     parameters: Type.Object({
       channel: Type.Union([Type.Literal("wechat"), Type.Literal("qq")], {
-        description: "要登录哪个通道：wechat = 微信（扫码绑定），qq = QQ（需在 NapCat 里扫码）",
+        description: "要登录哪个通道：wechat = 微信（扫码绑定），qq = QQ（扫码登录 NapCat）",
       }),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -297,7 +297,7 @@ export default function imRelay(pi: ExtensionAPI): void {
       return text(
         params.channel === "wechat"
           ? "微信登录二维码已经发到对话里了。请用手机微信扫它并在手机上确认；若要求输入数字配对码，界面会弹输入框。凭据约 24 小时后过期。"
-          : "QQ 的登录需要你在 NapCat 客户端里扫码，扩展这边会自动连接。",
+          : "QQ 登录二维码已经发到对话里了。请用手机 QQ 扫它并在手机上确认，随后扩展会自动连上 NapCat 的 OneBot11 服务。二维码约 2 分钟过期，过期后重新说一次「QQ登录」就会重新出码。",
       );
     },
   });
@@ -431,7 +431,7 @@ export default function imRelay(pi: ExtensionAPI): void {
             ctx.ui?.notify("已重新展示登录二维码。", "info");
             return;
           }
-          ctx.ui?.notify("当前没有待扫描的二维码。先执行 /im login wechat。", "warning");
+          ctx.ui?.notify("当前没有待扫描的二维码。先执行 /im login qq 或 /im login wechat。", "warning");
           return;
         }
         case "qr-hide":

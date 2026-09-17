@@ -190,7 +190,7 @@ function registerChannels(host: RelayHost): void {
         onMessage: (message) => router.accept(message),
         onStatusChange: (status) => router.handleChannelStatus(status),
         onLoginQr: (payload) => deliverLoginQr(host, payload),
-        onLoginQrFallback: (url) => deliverLoginQrFallback(host, url),
+        onLoginQrFallback: (url) => deliverLoginQrFallback(host, url, "QQ登录"),
       },
       config.maxReplyChars,
     ),
@@ -203,7 +203,7 @@ function registerChannels(host: RelayHost): void {
         onStatusChange: (status) => router.handleChannelStatus(status),
         onPrompt: (question) => router.handleChannelPrompt(question),
         onLoginQr: (payload) => deliverLoginQr(host, payload),
-        onLoginQrFallback: (url) => deliverLoginQrFallback(host, url),
+        onLoginQrFallback: (url) => deliverLoginQrFallback(host, url, "微信登录"),
       },
       config.maxReplyChars,
     ),
@@ -238,17 +238,30 @@ export function deliverLoginQr(host: RelayHost, payload: { channel: string; qr: 
   log.info(`已投递 ${payload.channel} 登录二维码（方式：${via}）`);
 }
 
-export function deliverLoginQrFallback(host: RelayHost, url: string): void {
-  deliverLoginQrFallbackTo(loginUiPort(host), url, "微信登录");
+export function deliverLoginQrFallback(host: RelayHost, url: string, name = "登录"): void {
+  deliverLoginQrFallbackTo(loginUiPort(host), url, name);
 }
 
-/** 重新投递当前二维码（/im qr）。 */
+/**
+ * 重新投递当前二维码（/im qr）。
+ *
+ * 遍历所有通道 —— QQ 现在也是扫码登录，不能只看微信。都没码时
+ * 退回到最近一次投递过的码（例如刚扫码成功、渠道已清空的情况）。
+ */
 export function showQrAgain(host: RelayHost): boolean {
-  const channel = host.router.channel("wechat") as { loginQr?: () => QrPayload | undefined } | undefined;
-  const qr = channel?.loginQr?.();
-  if (!qr) return false;
-  deliverLoginQr(host, { channel: "wechat", qr });
-  return true;
+  for (const id of ["qq", "wechat"] as const) {
+    const channel = host.router.channel(id) as { loginQr?: () => QrPayload | undefined } | undefined;
+    const qr = channel?.loginQr?.();
+    if (qr) {
+      deliverLoginQr(host, { channel: id, qr });
+      return true;
+    }
+  }
+  if (host.lastQr) {
+    deliverLoginQr(host, host.lastQr);
+    return true;
+  }
+  return false;
 }
 
 /**

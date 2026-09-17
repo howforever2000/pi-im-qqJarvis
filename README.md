@@ -6,6 +6,8 @@
 
 ```
 QQ 用户 ──► 腾讯 ──► NapCat(本机登录) ──ws://127.0.0.1:3001──┐
+                         ▲                                    │
+                         └──http://127.0.0.1:6099 (WebUI 取二维码)
                                                               ├─► pi-im-relay ─► pi agent ─► 你的项目
 微信用户 ──► 腾讯 iLink 云 ──HTTPS 长轮询(出站)──────────────┘         ▲                │
                                                                        └── 最终答复 ◄───┘
@@ -25,7 +27,8 @@ QQ 用户 ──► 腾讯 ──► NapCat(本机登录) ──ws://127.0.0.1:3
 本项目的两条通道**都是出站长连接**：
 
 - **QQ**：NapCat 以 QQNT 客户端身份出站连腾讯服务器；它对本机暴露的 OneBot11 WebSocket 是
-  `127.0.0.1:3001` 的回环地址，数据包不出网卡。你的机器全程没有监听任何公网端口。
+  `127.0.0.1:3001`、WebUI 是 `127.0.0.1:6099`，都是回环地址，数据包不出网卡。
+  你的机器全程没有监听任何公网端口。
 - **微信**：iLink 是腾讯官方 ClawBot 通道，你的进程**主动发起** HTTPS `getupdates` 长轮询与
   `sendmessage`，没有任何一行代码需要被外部访问。
 
@@ -52,6 +55,7 @@ QQ 用户 ──► 腾讯 ──► NapCat(本机登录) ──ws://127.0.0.1:3
 ```
 
 agent 会自己调用 `im_relay_login` 工具，二维码随后作为**图片**出现在对话里。
+**QQ 也是同一套体验**：把上面换成「QQ登录」即可（详见第二节）。
 同样可以问「IM 连上了吗」，agent 会调 `im_relay_status` 把状态拿给你。
 
 ### 把本机文件发回聊天（QQ 专属，微信暂不支持）
@@ -182,15 +186,46 @@ pi install /d/YUAN\ HAO/Documents/.pi/pi-im-relay
 
 ## 二、接入 QQ（NapCat）
 
-QQ 侧需要 **NapCat** —— 一个基于官方 QQNT 内核的 OneBot11 实现。本项目**不管理 NapCat 的生命周期**，
-只连接它的 OneBot11 服务，这样职责最清晰、升级互不影响。
+QQ 侧需要 **NapCat** —— 一个基于官方 QQNT 内核的 OneBot11 实现。本项目**不管理 NapCat 的进程生命周期**
+（不替你启动/重启它），但**接管它的扫码登录**：二维码会像微信那样直接出现在 pi 的对话里。
 
-### 1. 安装并登录 NapCat
+这样职责仍然清晰（NapCat 的版本、升级、账号归它管），但你不必再切到 NapCat 的界面去扫码。
+
+### 1. 安装并启动 NapCat
 
 到 <https://github.com/NapNeko/NapCatQQ/releases> 下载 Windows 版（或用官方文档
-<https://napneko.github.io/> 里的其它安装方式），启动后**用你要当机器人的那个 QQ 号扫码登录**。
+<https://napneko.github.io/> 里的其它安装方式），启动它。**不要在这里扫码登录** —— 下一步在 pi 里扫。
 
-### 2. 开启 OneBot11 服务
+> NapCat 会开一个本机 WebUI（默认 `127.0.0.1:6099`），它的密码存在
+> `<NapCat>/NapCat.Shell/config/webui.json` 里。本项目就是通过这个 WebUI 拿二维码的，
+> 默认会自动去读这个文件，所以 token 一般不用手填。
+
+### 2. 在 pi 里扫码登录 QQ
+
+和微信**完全一样**：在对话框里直接说：
+
+```
+QQ登录
+```
+
+或者敲命令 `/im login qq`、让 agent 调 `im_relay_login(channel: "qq")` —— 三条路都通向
+同一个入口（`startLogin()`），所以不会出现「两条路各出一张码」。
+
+二维码会直接出现在你的界面上，投递方式按界面能力自动选择：
+
+| 界面 | 二维码怎么显示 |
+| --- | --- |
+| **pi-web / Web UI** | 作为一张 **PNG 图片**出现在对话流里，手机直接扫 |
+| **终端 TUI** | 用半块字符 `▀▄█` 画在编辑器上方，屏幕可扫 |
+| **文本模型**（不支持读图） | 自动改用代码块里的 ASCII 二维码 |
+
+用**手机 QQ** 扫码并在手机上确认。两分钟内的重复触发只会把**同一张码**重发给你，
+不会向 NapCat 再要一张。扫码确认后通道会自动连上 OneBot11 并转成 `online`，不需要重启 pi。
+
+> 二维码约 2 分钟过期。NapCat 会自己换码，扩展检测到链接变化就会把**新码**投给你；
+> 也可以再发一次「QQ登录」手动换码。`/im qr` 随时重新推一次当前二维码。
+
+### 3. 开启 OneBot11 服务
 
 NapCat WebUI → 网络配置 → 新建 **WebSocket 服务器**：
 
@@ -201,7 +236,7 @@ NapCat WebUI → 网络配置 → 新建 **WebSocket 服务器**：
 | Token | 建议设置一个，填到下面的配置里 |
 | 消息格式 | `array`（必须，否则收不到结构化消息段） |
 
-### 3. 填写 pi-im-relay 配置
+### 4. 填写 pi-im-relay 配置
 
 编辑 `<agentDir>/im-relay/config.json`：
 
@@ -216,11 +251,22 @@ NapCat WebUI → 网络配置 → 新建 **WebSocket 服务器**：
       "allowUsers": ["你的QQ号"],      // 私聊白名单
       "allowGroups": ["允许的群号"],    // 群白名单；空 = 所有群都不响应
       "groupTrigger": "mention",        // mention = 只在 @bot 时响应；all = 全响应
-      "progress": "live"                // live = 实时回传工具调用进度
+      "progress": "live",              // live = 实时回传工具调用进度
+      "webui": {                       // 扫码登录用；token 一般不用填，自动读 NapCat 的 webui.json
+        "enabled": true,
+        "host": "127.0.0.1",
+        "port": 6099,
+        "token": "",
+        "configFile": "D:\\NapCat\\NapCat.Shell\\config\\webui.json"
+      }
     }
   }
 }
 ```
+
+> NapCat 装在别处就把 `configFile` 改掉（或用环境变量 `NAPCAT_DIR` / `NAPCAT_WEBUI_CONFIG`）。
+> `webui.enabled: false` 表示不要从 pi 里扫码，回到「自己去 NapCat 界面扫」的老方式。
+> QQ 已经登录时，扫码流程会直接跳过，不会多要一张码。
 
 然后在 pi 里执行 `/im reload`。
 
@@ -232,6 +278,9 @@ NapCat WebUI → 网络配置 → 新建 **WebSocket 服务器**：
 ## 三、接入微信（iLink / ClawBot）
 
 微信走腾讯官方 ClawBot（iLink）通道，**扫码绑定**，不需要服务器或回调地址。
+
+> 登录交互与 QQ 完全一致（第二节第 2 步）：二维码直接进对话。区别在服务端 ——
+> 微信用腾讯 iLink，QQ 用本机 NapCat 的 WebUI。
 
 ```jsonc
 {
@@ -300,7 +349,7 @@ NapCat WebUI → 网络配置 → 新建 **WebSocket 服务器**：
 | `/resume <编号>` | 切换到指定会话（编号 5 分钟内有效） |
 | `/model` | 列出可用模型 |
 | `/model <编号>` | 切换模型 |
-| `/login wechat` | 重新扫码登录微信 |
+| `/login [qq\|wechat]` | 重新扫码登录（默认 wechat；二维码直接进界面） |
 | `/qr` | 重新展示登录二维码 |
 | `/ping` | 连通性测试 |
 
@@ -312,7 +361,7 @@ NapCat WebUI → 网络配置 → 新建 **WebSocket 服务器**：
 
 | 工具 | 作用 |
 | --- | --- |
-| `im_relay_login` | 发起 QQ / 微信登录；用户说「登录微信」时 agent 会调用它 |
+| `im_relay_login` | 发起 QQ / 微信登录；用户说「登录微信」「QQ登录」时 agent 会调用它（二维码由扩展自动投递） |
 | `im_relay_status` | 返回通道状态、活跃会话、队列、进程锁情况 |
 
 在 pi 终端里可用的管理命令：
@@ -460,6 +509,7 @@ IM 驱动的是**你本机真实权限的 agent**：它能读写你的文件、�
 
 ```
 channels/qq.ts       OneBot11 WS 客户端：事件 → InboundMessage；send() → send_private_msg
+channels/napcat-webui.ts  NapCat WebUI 客户端：QQ 扫码登录（凭证哈希、取码、状态轮询）
 channels/wechat.ts   iLink：扫码登录 + getupdates 长轮询 + sendmessage + CDN 媒体
 channels/ilink-*.ts  iLink 协议层（类型、HTTP、AES-128-ECB 媒体解密）
 router.ts            准入（白名单/去重/限流）→ 排队 → 注入 pi → 回传
@@ -486,9 +536,13 @@ router 维护一个 current job：一个 turn 的产出只回给触发它的那�
 | 页脚显示 `IM ⏸ 已被其它 pi 进程占用` | 你同时开了两个 pi（比如终端 + 桌面端）。`/im status` 会告诉你是哪个 pid 占着；关掉那个即可，或直接在那边用。 |
 | 多个会话，手机消息进错了窗口 | 执行 `/im attach` 把它钉在当前会话；`/im sessions` 查看当前活跃会话。 |
 | QQ 状态 `error`，提示 NapCat 不可达 | NapCat 没启动，或 OneBot11 服务没开，或端口/Token 不匹配。`/im status` 里有基于 TCP 探测的具体诊断。 |
+| QQ `needs-login`（提示去 `/im login qq`） | NapCat 活着但 QQ 没登录 —— 此时 WebUI 可达、3001 端口不可达，扩展会自动区分这两种情况。在对话里发「QQ登录」扫码即可。 |
+| 页脚提示 `QQ 未登录` | 同上；直接说「QQ登录」。 |
 | QQ 收到消息但 bot 不回复 | 白名单没配。先发一句，看是否回「你不在白名单里」。 |
 | 群里怎么 @ 都不理 | `groupTrigger` 是 `mention` 时需要真 @；另外群号要在 `allowGroups` 里。 |
 | 微信 `needs-login` | 凭据过期（约 24h）。执行 `/im login wechat` 重新扫码 —— 二维码会直接出现在界面上。 |
+| QQ 二维码过期了 | 约 2 分钟失效。NapCat 自己换码，扩展会把新码重新投给你；没收到就再说一次「QQ登录」。 |
+| `/im login qq` 报 token 不对 | NapCat 的 WebUI 密码与 `channels.qq.webui.configFile` 指向的 `webui.json` 不一致。改配置或用 `webui.token` 显式覆盖。 |
 | 微信回复被拒 / 收不到 | 24h 内超过 10 条主动消息额度，或 `context_token` 已失效 —— 让对方先发一条消息即可恢复。 |
 | 二维码显示不全 | `/im qr` 重新推一次；扫描仍失败就用二维码消息里附带的链接。 |
 | 回复里出现 `**加粗**` 符号 | 不会 —— 回传前会做 markdown → 纯文本转换（代码块内容保持原样）。 |
@@ -500,12 +554,14 @@ router 维护一个 current job：一个 turn 的产出只回给触发它的那�
 
 ```bash
 npm install
-npm test          # 84 个用例
+npm test          # 114 个用例
 ```
 
 测试里包含这些**不依赖真实账号**的仿真：
 
 - **假的 NapCat OneBot11 WebSocket 服务器** —— 完整验证 QQ 收发链路
+- **假的 NapCat WebUI** —— 验证 QQ 扫码登录：token 哈希是否正确、凭证复用（不撞 WebUI 的
+  3 次/分钟登录限流）、重复触发只复用同一张码、NapCat 自行换码时投新码、扫码确认后自动上线
 - **二维码编解码往返** —— 生成 PNG 后用 `pngjs` 解回像素、`jsqr` 识别内容，
   断言解出来的就是原文；这同时验证了 `qr.ts` 里手写的 1bit PNG 编码器是正确的
 - **假的 UI 端口** —— 把 pi-web / TUI / 文本模型三种投递策略钉死
@@ -519,7 +575,10 @@ npm test          # 84 个用例
 - `pi` 0.84.3 与 0.85.1 终端（print 模式与 TUI）
 - `@agegr/pi-web` 0.8.11 与 0.9.1：headless 服务与 **真实 Electron 桌面端**（`--smoke` 与正常运行）
 - 真实腾讯 iLink 接口：`get_bot_qrcode` / `get_qrcode_status`（返回 `wait`）/ 长轮询行为
+- 真实 NapCat WebUI 接口：`/api/auth/login`（`sha256(token + ".napcat")`）/ `GetQQLoginQrcode` /
+  `CheckLoginStatus` / `RefreshQRcode`
 - 假 iLink 服务器：二维码复用、过期换码、确认写凭据、拒绝重复申请
+- 假 NapCat WebUI：同上，另加 token 错误与 WebUI 不可达两条错误路径
 
 ---
 

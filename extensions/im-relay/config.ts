@@ -25,6 +25,27 @@ export const LOG_DIR = join(DATA_DIR, "logs");
 export const LOG_FILE = join(LOG_DIR, "im-relay.log");
 export const WECHAT_SESSION_FILE = join(STATE_DIR, "wechat-session.json");
 export const CHAT_MAP_FILE = join(STATE_DIR, "chat-map.json");
+/** QQ 登录二维码的文本兜底（图片投递不可用时用链接） */
+export const QQ_QR_FILE = join(STATE_DIR, "qq-login-qrcode.txt");
+
+/**
+ * NapCat WebUI 的连接参数。
+ *
+ * 为什么需要它：QQ 的扫码登录要和微信走同一条路（二维码进对话，而不是让用户
+ * 自己去 NapCat 界面扫），而 NapCat 只在 WebUI 上暴露了登录 API。
+ * token 一般不用手填 —— 指向 NapCat 自己的 webui.json 自动读即可。
+ */
+export interface QqWebuiConfig {
+  enabled: boolean;
+  /** NapCat WebUI 地址（本机回环） */
+  host: string;
+  /** NapCat WebUI 端口，默认 6099 */
+  port: number;
+  /** 显式 token；留空则从 configFile / 环境变量里读 */
+  token: string;
+  /** NapCat 的 webui.json 路径；留空则用默认路径与环境变量探测 */
+  configFile: string;
+}
 
 export type ProgressMode = "off" | "live";
 
@@ -43,6 +64,8 @@ export interface QqConfig {
   groupTrigger: "mention" | "all";
   /** 是否把 agent 的中间工具调用进度实时发到 QQ */
   progress: ProgressMode;
+  /** NapCat WebUI：用于「在 pi 里扫码登录 QQ」 */
+  webui: QqWebuiConfig;
 }
 
 export interface WechatConfig {
@@ -94,6 +117,14 @@ export const DEFAULT_CONFIG: ImRelayConfig = {
       allowGroups: [],
       groupTrigger: "mention",
       progress: "live",
+      webui: {
+        enabled: true,
+        host: "127.0.0.1",
+        port: 6099,
+        token: "",
+        // NapCat 默认安装位置；存在就自动读取里面的 host/port/token
+        configFile: "D:\\NapCat\\NapCat.Shell\\config\\webui.json",
+      },
     },
     wechat: {
       enabled: false,

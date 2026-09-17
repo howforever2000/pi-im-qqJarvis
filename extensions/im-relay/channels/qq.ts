@@ -8,7 +8,16 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { createLogger, errorText } from "../log.ts";
-import type { QqConfig } from "../config.ts";
+import { QQ_QR_FILE, type QqConfig } from "../config.ts";
+import { renderQr, type QrRender } from "../qr.ts";
+import {
+  NapcatWebuiClient,
+  NapcatWebuiError,
+  isAlreadyLoggedIn,
+  resolveWebuiOptions,
+  type NapcatLoginPhase,
+  type NapcatLoginStatus,
+} from "./napcat-webui.ts";
 import {
   OneBotClient,
   asSegments,
@@ -31,6 +40,12 @@ import {
 
 const log = createLogger("qq");
 const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
+/** 二维码复用窗口：这段时间内重复触发只重发，不重新申请 */
+const QR_REUSE_WINDOW_MS = 120_000;
+/** 等扫码的上限 */
+const LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
+/** 登录状态轮询间隔 */
+const LOGIN_POLL_MS = 1500;
 
 interface QqRoute {
   userId?: string;
@@ -48,6 +63,15 @@ export class QqChannel implements Channel {
   private selfId = "";
   private stopping = false;
 
+  /** NapCat WebUI 客户端（扫码登录用），惰性创建 */
+  private webui: NapcatWebuiClient | undefined;
+  private qr: QrRender | undefined;
+  private qrUrl: string | undefined;
+  private qrIssuedAt = 0;
+  private loginController: AbortController | undefined;
+  /** 正在进行的扫码确认流程（beginLogin 启动、waitForLogin 等待） */
+  private loginLoop: Promise<void> | undefined;
+
   private readonly config: QqConfig;
   private readonly hooks: ChannelHooks;
   private readonly maxReplyChars: number;
@@ -64,8 +88,18 @@ export class QqChannel implements Channel {
       name: this.name,
       state: this.state,
       detail: this.detail,
+      qrAscii: this.qr?.ascii,
+      qrImage: this.qr
+        ? { mimeType: this.qr.image.mimeType, base64: this.qr.image.base64, size: this.qr.image.size }
+        : undefined,
+      qrText: this.qr?.text,
       lastInboundAt: this.lastInboundAt,
     };
+  }
+
+  /** 当前登录二维码（供 /im qr 按界面能力重新投递）。 */
+  loginQr(): QrRender | undefined {
+    return this.qr;
   }
 
   async start(): Promise<void> {
@@ -74,6 +108,9 @@ export class QqChannel implements Channel {
       return;
     }
     this.stopping = false;
+    // 登录成功后重新 start() 时，要先收掉旧连接（连同它的重连定时器），否则会留下两条
+    this.client?.close();
+    this.client = undefined;
     this.setState("connecting", `连接 ${this.config.host}:${this.config.port} …`);
 
     const client = new OneBotClient({
@@ -99,10 +136,7 @@ export class QqChannel implements Channel {
       const base = `${message}｜请确认 NapCat 已启动、OneBot11 服务已开启（${this.config.host}:${this.config.port}）`;
       this.setState("error", base);
       // 把模糊的 “WebSocket error” 变成可操作的结论
-      void client.probePort().then((verdict) => {
-        if (this.stopping) return;
-        this.setState("error", `${base}\n诊断：${verdict}`);
-      });
+      void this.diagnose(base, () => client.probePort());
     });
 
     try {
@@ -115,6 +149,10 @@ export class QqChannel implements Channel {
   }
 
   private async afterConnect(): Promise<void> {
+    // 已经连上 OneBot 就说明登录流程结束了，把扫码轮询收掉
+    this.loginController?.abort();
+    this.qr = undefined;
+    this.qrUrl = undefined;
     try {
       this.selfId = await (this.client?.fetchSelfId() ?? Promise.resolve(""));
     } catch (error) {
@@ -124,8 +162,45 @@ export class QqChannel implements Channel {
     this.setState("online", `已连接 NapCat（${who}）`);
   }
 
+  /**
+   * OneBot11 连不上时的诊断。
+   *
+   * 最要紧的一种情况是「NapCat 活着，只是 QQ 没登录」—— 这时只报
+   * “WebSocket error” 是误导的，正确的结论是「去扫码」。WebUI 能回答这个问题，
+   * 所以只要它可达就优先问它。
+   */
+  private async diagnose(base: string, probe: () => Promise<string>): Promise<void> {
+    const verdict = await probe().catch(() => undefined);
+    if (this.stopping) return;
+
+    if (this.config.webui?.enabled) {
+      try {
+        const status = await this.webuiOrThrow().status();
+        if (this.stopping) return;
+        if (!status.isLogin) {
+          this.setState(
+            "needs-login",
+            "NapCat 已启动，但 QQ 还没登录 → 执行 /im login qq 扫码（在对话里说「QQ登录」也行）" +
+              (verdict ? `\n诊断：${verdict}` : ""),
+          );
+          return;
+        }
+        this.setState(
+          "error",
+          `${base}\n诊断：${verdict ?? "未知"}\nNapCat 显示 QQ 已登录，请检查 OneBot11 服务是否已开启（端口 ${this.config.port}）。`,
+        );
+        return;
+      } catch (error) {
+        log.debug(`WebUI 诊断失败: ${errorText(error)}`);
+      }
+    }
+
+    this.setState("error", `${base}\n诊断：${verdict ?? "未知"}`);
+  }
+
   async stop(): Promise<void> {
     this.stopping = true;
+    this.loginController?.abort();
     this.client?.close();
     this.client = undefined;
     this.setState("off", "已停止");
@@ -279,8 +354,219 @@ export class QqChannel implements Channel {
     }
   }
 
+  /* ---------------------------- 扫码登录 ---------------------------- */
+
+  private webuiOrThrow(): NapcatWebuiClient {
+    if (!this.config.webui?.enabled) {
+      throw new ChannelError(
+        "QQ 的扫码登录需要 NapCat WebUI（config.json 里 channels.qq.webui.enabled 目前是 false）",
+      );
+    }
+    if (!this.webui) this.webui = new NapcatWebuiClient(resolveWebuiOptions(this.config.webui));
+    return this.webui;
+  }
+
+  /**
+   * 申请登录二维码并开始轮询，**返回时二维码一定已经投递出去**。
+   *
+   * 与微信通道同一套语义：已有新鲜二维码时只重发、不重新申请。
+   * 这是被真实踩过的坑 —— 用户一边敲 `/im login qq` 一边又说「QQ登录」，
+   * 两条路各申请一张码，对话里出现两张，不知道该扫哪一张。
+   */
+  async beginLogin(): Promise<void> {
+    if (!this.config.enabled) throw new ChannelError("QQ 通道在配置中被禁用");
+    if (this.loginActive()) {
+      log.info("已有进行中的 QQ 登录二维码，直接复用（不重复申请）");
+      this.reissueQr();
+      return;
+    }
+
+    const webui = this.webuiOrThrow();
+    this.loginController?.abort();
+    const controller = new AbortController();
+    this.loginController = controller;
+    this.qr = undefined;
+    this.qrUrl = undefined;
+    this.setState("connecting", "正在向 NapCat 申请登录二维码 …");
+
+    let status: NapcatLoginStatus;
+    try {
+      status = await webui.status();
+    } catch (error) {
+      const message = describeWebuiFailure(error);
+      this.setState("error", message);
+      throw new ChannelError(message);
+    }
+
+    // 已经在 NapCat 里登录过了：不用扫码，直接恢复通道
+    if (status.coreReady) {
+      log.info("NapCat 已处于登录状态，跳过扫码直接连接 OneBot11");
+      await this.start();
+      return;
+    }
+
+    let url = status.qrcodeurl;
+    if (!url) {
+      const refreshed = await webui.refreshQrcode().catch(() => ({ url: "", restarting: false }));
+      if (!refreshed.url && refreshed.restarting) {
+        throw new ChannelError("NapCat 正在重启登录服务，请等十几秒后再发一次「QQ登录」");
+      }
+      url = refreshed.url;
+    }
+    if (!url) {
+      try {
+        url = await webui.fetchQrcodeUrl();
+      } catch (error) {
+        const message = describeWebuiFailure(error);
+        this.setState("error", message);
+        throw new ChannelError(message);
+      }
+    }
+
+    this.publishQr(url, status.loginPhase);
+
+    const loop = this.pollLogin(controller, webui);
+    this.loginLoop = loop;
+    // 挂一个空 catch，避免没人 await 时变成 unhandled rejection
+    loop.catch(() => undefined).finally(() => {
+      if (this.loginLoop === loop) this.loginLoop = undefined;
+    });
+  }
+
+  /** 等待当前登录流程结束（扫码确认 / 超时 / 失败）。 */
+  async waitForLogin(): Promise<void> {
+    await this.loginLoop?.catch(() => undefined);
+  }
+
+  /** 是否已有可复用的登录二维码。 */
+  loginActive(maxAgeMs = QR_REUSE_WINDOW_MS): boolean {
+    return Boolean(this.loginLoop && this.qr && Date.now() - this.qrIssuedAt < maxAgeMs);
+  }
+
+  /** 把当前二维码重发一次（不向 NapCat 申请新的）。 */
+  reissueQr(): boolean {
+    if (!this.qr) return false;
+    this.hooks.onLoginQr?.({ channel: this.id, qr: this.qr });
+    return true;
+  }
+
+  /** Channel 接口要求的 login()：发起 + 等待。 */
   async login(): Promise<void> {
-    throw new ChannelError("QQ 的登录由 NapCat 负责，请扫码登录 NapCat 后本通道会自动恢复。");
+    await this.beginLogin();
+    await this.waitForLogin();
+  }
+
+  /**
+   * 轮询 NapCat 的登录状态直到扫码确认 + 核心就绪。
+   *
+   * 二维码过期换码不用自己算时间：NapCat 会自己刷新，换码后 `qrcodeurl` 就变了，
+   * 这里跟着把新码投给用户即可。
+   */
+  private async pollLogin(controller: AbortController, webui: NapcatWebuiClient): Promise<void> {
+    const deadline = Date.now() + LOGIN_TIMEOUT_MS;
+
+    while (!controller.signal.aborted && Date.now() < deadline) {
+      let status: NapcatLoginStatus;
+      try {
+        status = await webui.status();
+      } catch (error) {
+        if (controller.signal.aborted) break;
+        // 凭证/token 这类错误重试也没用，直接报给用户
+        if (error instanceof NapcatWebuiError && error.kind === "auth") {
+          this.setState("error", describeWebuiFailure(error));
+          return;
+        }
+        log.debug(`QQ 登录状态查询失败，稍后重试: ${errorText(error)}`);
+        await sleep(2000);
+        continue;
+      }
+
+      if (status.coreReady) {
+        this.setState("connecting", "QQ 登录成功，正在连接 OneBot11 …");
+        await this.start();
+        return;
+      }
+
+      if (status.loginError) {
+        this.setState("error", `NapCat 登录出错：${status.loginError}`);
+        return;
+      }
+
+      switch (status.loginPhase) {
+        case "qrcode_scanned":
+          this.setState("needs-login", "二维码已扫描，请在手机上确认登录");
+          break;
+        case "initializing":
+          this.setState("connecting", "QQ 已登录，正在初始化 OneBot 服务 …");
+          break;
+        case "reconnecting":
+          this.setState("connecting", "NapCat 正在重启登录服务，请稍候 …");
+          break;
+        case "offline":
+          this.setState("connecting", "NapCat 登录服务已断开，等待恢复 …");
+          break;
+        case "generating_qrcode":
+          this.setState("needs-login", "NapCat 正在生成二维码 …");
+          break;
+        case "waiting_qrcode":
+        default:
+          if (status.qrcodeurl && status.qrcodeurl !== this.qrUrl) {
+            this.publishQr(status.qrcodeurl, status.loginPhase);
+          } else if (!status.qrcodeurl && !this.qr) {
+            // 还没出码（比如刚重启完），主动催一张
+            try {
+              const refreshed = await webui.refreshQrcode();
+              if (refreshed.url) this.publishQr(refreshed.url, "waiting_qrcode");
+            } catch (error) {
+              log.debug(`刷新 QQ 二维码失败: ${errorText(error)}`);
+            }
+          } else {
+            this.setState("needs-login", loginPhaseText(status.loginPhase));
+          }
+          break;
+      }
+
+      await sleep(LOGIN_POLL_MS);
+    }
+
+    if (!controller.signal.aborted) {
+      throw new ChannelError("扫码登录超时（5 分钟），请重新发起「QQ登录」");
+    }
+  }
+
+  /**
+   * 新的二维码就绪：交给上层按界面能力投递（图片 / 终端 ASCII）。
+   * 同时落一份文本到磁盘，方便在图片不可用的环境下拷贝链接。
+   */
+  private publishQr(url: string, phase: NapcatLoginPhase): void {
+    let rendered: QrRender | undefined;
+    try {
+      rendered = renderQr(url, 8, 3);
+    } catch (error) {
+      log.warn(`二维码生成失败: ${errorText(error)}`);
+    }
+    this.qr = rendered;
+    this.qrUrl = url;
+    this.qrIssuedAt = Date.now();
+
+    void fs
+      .writeFile(
+        QQ_QR_FILE,
+        [
+          "QQ 登录二维码链接（请勿转发）：",
+          url,
+          "",
+          rendered?.ascii ?? "(二维码渲染失败，请直接使用上面的链接)",
+          "",
+        ].join("\n"),
+        { mode: 0o600 },
+      )
+      .catch(() => undefined);
+
+    // 先投递给界面，再改状态，避免界面还没拿到码就先看到「等待扫码」
+    if (rendered) this.hooks.onLoginQr?.({ channel: this.id, qr: rendered });
+    else this.hooks.onLoginQrFallback?.(url);
+    this.setState("needs-login", loginPhaseText(phase));
   }
 }
 
@@ -312,4 +598,27 @@ function sleep(ms: number): Promise<void> {
     const timer = setTimeout(resolve, ms);
     timer.unref?.();
   });
+}
+
+/** 登录阶段 → 给用户看的一句话。 */
+function loginPhaseText(phase: NapcatLoginPhase): string {
+  switch (phase) {
+    case "qrcode_scanned":
+      return "二维码已扫描，请在手机上确认登录";
+    case "generating_qrcode":
+      return "NapCat 正在生成二维码 …";
+    case "initializing":
+      return "QQ 已登录，正在初始化 …";
+    default:
+      return "等待手机 QQ 扫码确认";
+  }
+}
+
+/** 把 WebUI 的各类失败翻译成用户能照做的结论。 */
+function describeWebuiFailure(error: unknown): string {
+  if (isAlreadyLoggedIn(error)) {
+    return "NapCat 显示 QQ 已经登录，不需要扫码。若通道仍未在线，请检查 OneBot11 服务是否已开启（或执行 /im reload）。";
+  }
+  if (error instanceof NapcatWebuiError) return error.message;
+  return errorText(error);
 }

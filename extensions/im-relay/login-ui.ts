@@ -48,6 +48,22 @@ export function channelDisplayName(channel: string): string {
 }
 
 /**
+ * 二维码下方的扫码说明。两个通道的时效性完全不同，不能共用一句话：
+ * 微信凭据是 24h（过期要重新扫码绑定），QQ 二维码只有约 2 分钟（但登录一次能长期在线）。
+ */
+function loginHints(channel: string): { how: string; expiry: string } {
+  return channel === "wechat"
+    ? {
+        how: "用手机微信扫下面的二维码并在手机上确认。",
+        expiry: "凭据约 24 小时后过期，届时需要重新登录。",
+      }
+    : {
+        how: "用手机 QQ 扫下面的二维码并在手机上确认。",
+        expiry: "二维码约 2 分钟过期；过期后再说一次「QQ登录」就会重新出码。",
+      };
+}
+
+/**
  * 投递二维码。返回实际使用的投递方式，便于测试与日志。
  */
 export function deliverLoginQr(
@@ -69,15 +85,14 @@ export function deliverLoginQr(
   }
 
   const link = `扫码失败时可直接使用这个链接：${payload.qr.text}`;
-  const expiry =
-    payload.channel === "wechat" ? "凭据约 24 小时后过期，届时需要重新登录。" : "确认后即可收发消息。";
+  const hints = loginHints(payload.channel);
 
   // 模型看不了图 → 不要浪费一次图片投递，改用等宽代码块里的 ASCII 二维码
   if (!port.supportsImages()) {
     const rendered = [
       "这是发给**你**扫的，模型不需要解读它。",
-      "用手机扫下面的二维码并在手机上确认。",
-      expiry,
+      hints.how,
+      hints.expiry,
       "",
       "```",
       payload.qr.ascii,
@@ -103,10 +118,8 @@ export function deliverLoginQr(
   // 支持图片的界面：把 PNG 作为 custom message 发进对话，可以直接用手机扫
   const caption = [
     "这是发给**你**扫的，模型不需要解读它。",
-    "用手机扫上面的二维码并在手机上确认。",
-    payload.channel === "wechat"
-      ? "凭据约 24 小时后过期，届时需要重新登录。"
-      : "确认后即可收发消息。",
+    hints.how,
+    hints.expiry,
     "",
     `扫码失败时可直接使用这个链接：${payload.qr.text}`,
   ].join("\n");

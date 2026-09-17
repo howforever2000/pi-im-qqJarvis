@@ -79,6 +79,10 @@ function makeConfig(port: number, patch: (c: typeof DEFAULT_CONFIG.channels.qq) 
   config.port = port;
   config.allowUsers = ["1001"];
   config.allowGroups = ["555"];
+  // 这些用例只测 OneBot11 链路。WebUI 默认开着会去问本机 6099 端口，
+  // 让“不可达时进入 error”这类断言变成看机器脸色，所以这里显式关掉。
+  // QQ 登录的完整路径在 test/qq-login.test.ts 里对着假的 WebUI 服务器跑。
+  config.webui.enabled = false;
   patch(config);
   return config;
 }

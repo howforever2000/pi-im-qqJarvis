@@ -103,7 +103,7 @@ export interface Channel {
    * 没有上传发送，所以那边会直接返回「不支持」。
    */
   sendFile?(target: ChatTarget, filePath: string): Promise<void>;
-  /** 重新登录（微信扫码）；QQ 无法重登（由 NapCat 负责） */
+  /** 发起登录（微信 iLink 或 QQ 的 NapCat WebUI 扫码）；两者语义一致 */
   login?(): Promise<void>;
   /**
    * 只发起登录并投递二维码，不等用户确认；**返回时二维码一定已经发出去**。

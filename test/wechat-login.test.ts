@@ -91,7 +91,13 @@ async function startFakeIlink(): Promise<FakeIlink> {
   const address = server.address();
   const port = typeof address === "object" && address ? address.port : 0;
   state.baseUrl = `http://127.0.0.1:${port}`;
-  state.close = () => new Promise<void>((resolve) => server.close(() => resolve()));
+  state.close = () =>
+    new Promise<void>((resolve) => {
+      // 必须主动掉 keep-alive 连接：server.close() 只停监听，已建立的 socket 会一直
+      // 把测试进程挂在事件循环上（表现为整个测试文件超时）。
+      server.closeAllConnections?.();
+      server.close(() => resolve());
+    });
   return state;
 }
 

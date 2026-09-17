@@ -466,12 +466,14 @@ export class ImRelayRouter {
   }
 
   private handleQrCommand(target: ChatTarget): void {
-    const wechat = this.statuses.get("wechat");
-    if (!wechat?.qrAscii) {
+    const pending = ["qq", "wechat"]
+      .map((id) => this.statuses.get(id as ChannelId))
+      .find((status) => status?.qrAscii);
+    if (!pending) {
       // 请用户在本机终端执行 /im qr 查看
       void this.replyRaw(
         target,
-        "当前没有待扫描的二维码。若需要登录微信，请先执行 /login wechat，然后在本机 pi 终端执行 /im qr 查看二维码。",
+        "当前没有待扫描的二维码。若需要登录，请先说「QQ登录」或「微信登录」。",
       ).catch(() => undefined);
       return;
     }
@@ -544,7 +546,7 @@ const HELP_TEXT = `🤖 pi-im-relay 指令
 
 ★ 在输入框里直接发这几个词就能触发（不经过模型）：
   微信登录     出微信登录二维码
-  QQ登录       提示去 NapCat 扫码（QQ 登录由 NapCat 负责）
+  QQ登录       出 QQ 登录二维码（扫完自动连上 NapCat）
   IM状态       查看通道状态
 
 /help            显示这份帮助
