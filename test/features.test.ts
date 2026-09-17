@@ -217,6 +217,36 @@ test("记忆超长会被截断，且不抛错", async () => {
   }
 });
 
+test("截断时优先保住聊天记录（它是长会话记忆的命门）", async () => {
+  clearQzoneCache();
+  resetMemoryCache();
+  // 上一个用例把 AGENT.md 写成了 5000 字的 x，先还原，否则预算全被它吃满
+  fs.rmSync(AGENT_MD_FILE, { force: true });
+  // 故意把约定写长，模拟「用户自己维护的文档很长」这个现实情况
+  fs.writeFileSync(AGENT_MD_FILE, `# 工作约定\n${"约定内容。".repeat(400)}`);
+
+  const config = { ...DEFAULT_CONFIG.memory, maxChars: 1200, recent: 5, sample: 0, cacheSeconds: 0, chatLog: true };
+  const many = Array.from({ length: 20 }, (_v, i) =>
+    hist(1789620000 + i * 60, PEER, "百步飞剑", [{ type: "text", data: { text: `第 ${i} 条聊天内容` } }]),
+  );
+  const restore = stubFetch(() => page(0, 5, 5));
+  try {
+    const memory = await buildMemory(chatCaller(many), config, {
+      cacheKey: "qq:priority",
+      peer: { kind: "private", id: String(PEER) },
+    });
+    // 关键回归：约定再长，也不能把聊天记录整段挤掉
+    assert.match(memory.text, /## 最近的聊天记录/, "聊天记录不能被超长的工作约定挤掉");
+    assert.match(memory.text, /第 19 条聊天内容/, "应当保留最新的那条");
+    // 约定自己被裁到预算内（而不是把别人挤掉）
+    assert.match(memory.text, /此处按预算截断/, "超长的约定应当被按预算裁剪");
+    assert.ok(memory.text.length <= config.maxChars + 40, `全局上限也应当生效，实际 ${memory.text.length}`);
+  } finally {
+    fs.rmSync(AGENT_MD_FILE, { force: true });
+    restore();
+  }
+});
+
 test("memory.enabled=false 时完全不注入", async () => {
   resetMemoryCache();
   const memory = await buildMemory(callerFor(), { ...DEFAULT_CONFIG.memory, enabled: false });
@@ -230,4 +260,151 @@ test("超过阈值或含表格的建议走 PDF；短句不走", () => {
   assert.equal(shouldUsePdf("x".repeat(500), 300), true);
   assert.equal(shouldUsePdf("| a | b |\n|---|---|\n| 1 | 2 |", 300), true, "表格在手机上没法看，即使很短也应走 PDF");
   assert.equal(shouldUsePdf("x".repeat(500), 0), false, "阈值 0 表示关闭自动判定");
+});
+
+/* ---------------------------- 聊天记录（长会话记忆） ---------------------------- */
+
+const { readRecentChat, formatChatLines } = await import("../extensions/im-relay/chatlog.ts");
+
+/** 造一条历史消息 */
+function hist(
+  at: number,
+  senderUin: number,
+  nick: string,
+  message: unknown[],
+  raw = "",
+): Record<string, unknown> {
+  return { time: at, user_id: senderUin, sender: { user_id: senderUin, nickname: nick }, message, raw_message: raw };
+}
+
+const SELF = 2166029532;
+const PEER = 1279717885;
+
+const chatCaller = (messages: unknown[]) =>
+  (async (action: string): Promise<never> => {
+    if (action === "get_login_info") return { user_id: SELF } as never;
+    if (action === "get_friend_msg_history") return { messages } as never;
+    if (action === "get_group_msg_history") return { messages } as never;
+    throw new Error(`未预期的 action: ${action}`);
+  }) as never;
+
+test("读聊天记录：能分清「我说的」和「对方说的」，非文本段落用占位符", async () => {
+  const res = await readRecentChat(
+    chatCaller([
+      hist(1789620000, PEER, "百步飞剑", [{ type: "text", data: { text: "帮我看下磁盘" } }]),
+      hist(1789620060, SELF, "阿派的新家", [{ type: "text", data: { text: "D 盘剩 12G" } }]),
+      hist(1789620120, PEER, "百步飞剑", [
+        { type: "image", data: { file: "a.jpg" } },
+        { type: "text", data: { text: "这张存一下" } },
+      ]),
+      hist(1789620180, SELF, "阿派的新家", [{ type: "file", data: { file: "报告.pdf" } }]),
+    ]),
+    { kind: "private", id: String(PEER), count: 10 },
+  );
+
+  assert.equal(res.error, undefined, `不该报错：${res.error}`);
+  assert.equal(res.lines.length, 4);
+  assert.deepEqual(
+    res.lines.map((l) => l.fromSelf),
+    [false, true, false, true],
+    "方向判定错了就会把「我自己说过的话」当用户的话",
+  );
+  assert.equal(res.lines[2]?.text, "[图片]这张存一下");
+  assert.equal(res.lines[3]?.text, "[文件：报告.pdf]");
+  assert.ok(res.lines[0]!.at < res.lines[3]!.at, "应当按时间正序");
+});
+
+test("聊天记录压行：超长时保留最新的那几条", () => {
+  const lines = Array.from({ length: 30 }, (_v, i) => ({
+    at: 1789620000 + i * 60,
+    fromSelf: i % 2 === 0,
+    who: "百步飞剑",
+    text: `第 ${i} 条${"x".repeat(50)}`,
+  }));
+  const out = formatChatLines(lines, 300);
+  const rows = out.split("\n");
+  assert.ok(rows.length > 0 && rows.length < 30, `应当截断，实际 ${rows.length} 行`);
+  assert.match(rows[rows.length - 1] ?? "", /第 29 条/, "必须保留最新的一条");
+  assert.ok(!/第 0 条/.test(out), "最老的应当先被丢掉");
+});
+
+test("读聊天记录失败时返回 error 而不是抛错", async () => {
+  const res = await readRecentChat(
+    (async () => {
+      throw new Error("napcat down");
+    }) as never,
+    { kind: "private", id: String(PEER), count: 10 },
+  );
+  assert.deepEqual(res.lines, []);
+  assert.match(res.error ?? "", /napcat down/);
+});
+
+test("记忆里会带上最近聊天记录；关掉 chatLog 就不带", async () => {
+  clearQzoneCache();
+  resetMemoryCache();
+  // 上一个用例把 AGENT.md 写得很长，这里先恢复成默认的短版本，
+  // 否则 5000 字的约定会把整个预算吃满，后面的块全被截掉
+  fs.rmSync(AGENT_MD_FILE, { force: true });
+  const restore = stubFetch(() => page(0, 1, 1));
+
+  const messages = [
+    hist(1789620000, PEER, "百步飞剑", [{ type: "text", data: { text: "帮我改下热加载" } }]),
+    hist(1789620060, SELF, "阿派的新家", [{ type: "text", data: { text: "改好了" } }]),
+  ];
+  const base = { ...DEFAULT_CONFIG.memory, recent: 1, sample: 0, cacheSeconds: 0, chatLog: true, chatLogCount: 10 };
+  try {
+    const withChat = await buildMemory(chatCaller(messages), base, {
+      cacheKey: "qq:test",
+      peer: { kind: "private", id: String(PEER) },
+    });
+    assert.match(withChat.text, /## 最近的聊天记录/);
+    assert.match(withChat.text, /帮我改下热加载/);
+    assert.match(withChat.text, /我: 改好了/, "自己说的话要标成「我」");
+    assert.equal(withChat.chatLines.length, 2);
+
+    // 关掉之后不该出现这一段
+    resetMemoryCache();
+    const noChat = await buildMemory(chatCaller(messages), { ...base, chatLog: false }, {
+      cacheKey: "qq:test",
+      peer: { kind: "private", id: String(PEER) },
+    });
+    assert.doesNotMatch(noChat.text, /## 最近的聊天记录/);
+
+    // 不传 peer（例如没有协议通道）也不该炸
+    resetMemoryCache();
+    const noPeer = await buildMemory(chatCaller(messages), base, { cacheKey: "qq:test" });
+    assert.doesNotMatch(noPeer.text, /## 最近的聊天记录/);
+  } finally {
+    restore();
+  }
+});
+
+test("resetMemoryCache 之后会真的重新读一次（新会话/刚登录的语义）", async () => {
+  clearQzoneCache();
+  resetMemoryCache();
+  const restore = stubFetch(() => page(0, 1, 1));
+  const caller = (async (action: string): Promise<never> => {
+    if (action === "get_login_info") return { user_id: SELF } as never;
+    if (action === "get_cookies") return { cookies: "skey=x", bkn: "1" } as never;
+    if (action === "get_friend_msg_history") {
+      reads += 1;
+      return { messages: [hist(1789620000 + reads, PEER, "百步飞剑", [{ type: "text", data: { text: `第 ${reads} 次读` } }])] } as never;
+    }
+    throw new Error(`未预期的 action: ${action}`);
+  }) as never;
+  let reads = 0;
+  const config = { ...DEFAULT_CONFIG.memory, recent: 1, sample: 0, cacheSeconds: 3600, chatLog: true, chatLogCount: 5 };
+  const opts = { cacheKey: "qq:reset", peer: { kind: "private" as const, id: String(PEER) } };
+
+  try {
+    await buildMemory(caller, config, opts);
+    await buildMemory(caller, config, opts);
+    assert.equal(reads, 1, "缓存期内不该重复读");
+
+    resetMemoryCache();
+    await buildMemory(caller, config, opts);
+    assert.equal(reads, 2, "失效之后必须重新读一遍");
+  } finally {
+    restore();
+  }
 });

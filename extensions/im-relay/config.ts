@@ -125,6 +125,24 @@ export interface MemoryConfig {
   cacheSeconds: number;
   /** 身份定位说说的开头标记 */
   identityMarker: string;
+  /**
+   * 新会话 / 刚登录时，先拉最近的 IM 聊天记录垫进上下文。
+   *
+   * 为什么需要：pi 的上下文会被压缩，早期对话会从窗口里消失；而 IM 侧的
+   * 聊天记录是一份独立且完整的副本，把它们捞回来就能给长会话保持记忆。
+   */
+  chatLog: boolean;
+  /** 拉多少条（含双向） */
+  chatLogCount: number;
+  /**
+   * 每隔多少条入站消息重新完整注入一次记忆。
+   *
+   * 为什么要这个：完整记忆（约定 + 身份 + 聊天记录 + 说说）体积不小，
+   * 每条消息都塞一遍很贵；而完全不重塞又会在上下文被压缩后失忆。
+   * 所以策略是「新会话/刚登录时必发一次，之后每隔 N 条补发一次」。
+   * 设为 0 表示只在真正需要（新会话/刚登录）时注入。
+   */
+  refreshEveryMessages: number;
 }
 
 /** 长文转 PDF 出站。 */
@@ -174,11 +192,14 @@ export const DEFAULT_CONFIG: ImRelayConfig = {
   },
   memory: {
     enabled: true,
-    maxChars: 2000,
+    maxChars: 3000,
     recent: 5,
     sample: 5,
     cacheSeconds: 300,
     identityMarker: "[身份]",
+    chatLog: true,
+    chatLogCount: 10,
+    refreshEveryMessages: 15,
   },
   pdf: {
     enabled: true,

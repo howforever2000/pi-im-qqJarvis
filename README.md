@@ -640,11 +640,21 @@ pi-web 的「插件」页会把它列为已安装：
 | 字段 | 默认 | 说明 |
 | --- | --- | --- |
 | `memory.enabled` | `true` | 是否注入工作约定与主页内容 |
-| `memory.maxChars` | `2000` | 注入总长度上限，超出截断 |
+| `memory.maxChars` | `3000` | 注入总长度上限；**每个块另有独立预算**，不会互相挤掉 |
 | `memory.recent` | `5` | 读空间：最近 N 条 |
 | `memory.sample` | `5` | 读空间：历史抽样 M 条（从最旧的开始取） |
 | `memory.cacheSeconds` | `300` | 空间内容缓存时间，避免每条消息都打网络 |
 | `memory.identityMarker` | `"[身份]"` | 正文以它开头的说说被当作身份定位 prompt |
+| `memory.chatLog` | `true` | 是否读取最近的 IM 聊天记录作为长会话记忆 |
+| `memory.chatLogCount` | `10` | 拉多少条聊天记录（含双向，自己说的标为「我」） |
+| `memory.refreshEveryMessages` | `15` | 每隔多少条入站消息补发一次完整记忆；`0` = 只在真正需要时注入 |
+
+> **记忆注入的时机**：新会话开始（含新建 / 恢复 / fork / 重载）、通道刚登录成功、
+> 以及每 15 条消息。避免「每条都塞一遍」浪费 token，同时避免长会话被压缩后失忆。
+> 想要更实时，把 `refreshEveryMessages` 调小；想省钱就调到 `0`。
+>
+> 聊天记录的读取方法是 `get_friend_msg_history` / `get_group_msg_history`（主动拉），
+> 而不是监听事件 —— 因为 NapCat 的事件只推给一条连接。
 
 ### PDF `pdf`
 
@@ -681,7 +691,8 @@ channels/ilink-*.ts  iLink 协议层（类型、HTTP、AES-128-ECB 媒体解密�
 router.ts            准入（白名单/去重/限流）→ 排队 → 垫上下文 → 注入 pi → 回传
 album.ts             收图落盘、按内容去重、命名模板
 qzone.ts             读 QQ 空间（走空间网页接口，NapCat 没有读接口）
-memory.ts            记忆组装：AGENT.md + 身份说说 + 说说摘要
+chatlog.ts           读最近 IM 聊天记录（长会话记忆）
+memory.ts            记忆组装与注入策略：约定 + 身份 + 聊天记录 + 说说
 md.ts / pdf.ts       Markdown → HTML → Chrome 无头打印
 watch.ts             config.json 热加载（目录监听 + 去抖 + 内容哈希）
 store.ts             会话备注持久化

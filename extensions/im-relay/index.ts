@@ -25,6 +25,7 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@e
 import { CONFIG_FILE, DATA_DIR, LOG_FILE } from "./config.ts";
 import { closeLog, createLogger, errorText } from "./log.ts";
 import { renderPdf } from "./pdf.ts";
+import { resetMemoryCache } from "./memory.ts";
 import {
   ensureHost,
   getHost,
@@ -99,6 +100,10 @@ export default function imRelay(pi: ExtensionAPI): void {
 
     const isFirstSession = h.sessions.size === 0;
     cancelHostShutdown(h);
+    // 新会话（含新建 / 恢复 / fork / 重载）：让下一条消息重新读一遍聊天记录，
+    // 这样长会话被压缩之后也能接上前文。
+    resetMemoryCache();
+    h.router.markMemoryStale();
     registerSession(h, {
       id: sessionId,
       pi,

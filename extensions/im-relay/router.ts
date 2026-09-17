@@ -72,6 +72,9 @@ export interface RouterCarry {
   lastAssistantText?: string;
   lastStopReason?: string;
   toolCount: number;
+  /** 记忆注入的节流状态，重载时要接着算 */
+  memoryCount?: number;
+  memoryDirty?: boolean;
 }
 
 export class ImRelayRouter {
@@ -96,6 +99,15 @@ export class ImRelayRouter {
   private readonly lastTargets = new Map<ChannelId, ChatTarget>();
   private controlSeq = 0;
   private stopping = false;
+  /**
+   * 记忆注入的节流状态。
+   *
+   * 完整记忆（工作约定 + 身份 + 聊天记录 + 说说）体积不小，每条消息都塞一遍
+   * 很浪费 token；但完全不重塞又会在上下文被压缩后失忆。
+   * 所以：新会话/刚登录时必发一次（dirty=true），之后每隔 N 条补发一次。
+   */
+  private memoryCount = 0;
+  private memoryDirty = true;
 
   private config: ImRelayConfig;
   private readonly deps: PiPort;
@@ -171,6 +183,8 @@ export class ImRelayRouter {
       lastAssistantText: this.lastAssistantText,
       lastStopReason: this.lastStopReason,
       toolCount: this.toolCount,
+      memoryCount: this.memoryCount,
+      memoryDirty: this.memoryDirty,
     };
   }
 
@@ -184,6 +198,26 @@ export class ImRelayRouter {
     this.lastAssistantText = carry.lastAssistantText;
     this.lastStopReason = carry.lastStopReason;
     this.toolCount = carry.toolCount;
+    if (carry.memoryCount !== undefined) this.memoryCount = carry.memoryCount;
+    if (carry.memoryDirty !== undefined) this.memoryDirty = carry.memoryDirty;
+  }
+
+  /**
+   * 标记「下次必须完整注入记忆」。
+   *
+   * 两处会调：新会话开始（含新建/恢复/fork/重载）、以及通道刚登录成功。
+   * 这两个时刻正是用户要求「先读一遍聊天记录」的时机。
+   */
+  markMemoryStale(): void {
+    this.memoryDirty = true;
+  }
+
+  /** 这一条消息该不该注入记忆。 */
+  private shouldInjectMemory(): boolean {
+    if (!this.config.memory.enabled) return false;
+    if (this.memoryDirty) return true;
+    const every = this.config.memory.refreshEveryMessages;
+    return every > 0 && this.memoryCount > 0 && this.memoryCount % every === 0;
   }
 
   /** 由通道回调：状态变化。 */
@@ -280,19 +314,34 @@ export class ImRelayRouter {
     }
 
     if (this.config.memory.enabled) {
+      this.memoryCount += 1;
+    }
+    if (this.shouldInjectMemory()) {
       const channel = this.channels.get(inbound.channel);
       const raw = channel?.api;
       if (raw) {
+        // 对端：私聊就是对方，群聊就是群。聊天记录按对端分开读
+        const peer =
+          inbound.isGroup && inbound.groupId
+            ? ({ kind: "group", id: inbound.groupId } as const)
+            : ({ kind: "private", id: inbound.senderId } as const);
         try {
           const memory = await buildMemory(
             (action, params) => raw.call(channel, action, params),
             this.config.memory,
-            String(inbound.channel),
+            { cacheKey: `${inbound.channel}:${peer.id}`, peer },
           );
-          if (memory.text) notes.push(memory.text);
+          // 只有真的拿到内容才算「发过了」，否则留 dirty 下次再试
+          if (memory.text) {
+            notes.push(memory.text);
+            this.memoryDirty = false;
+          }
         } catch (error) {
           log.warn(`记忆组装失败（已跳过）：${errorText(error)}`);
         }
+      } else {
+        // 该通道没有协议接口（比如微信），读不了记忆；不要卡在 dirty 上反复重试
+        this.memoryDirty = false;
       }
     }
 

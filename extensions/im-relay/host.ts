@@ -25,6 +25,7 @@ import { QqChannel } from "./channels/qq.ts";
 import { WechatChannel } from "./channels/wechat.ts";
 import { DATA_DIR, loadConfig, saveConfig, type ImRelayConfig } from "./config.ts";
 import { startConfigWatch, stopConfigWatch, syncConfigWatch } from "./watch.ts";
+import { resetMemoryCache } from "./memory.ts";
 import type { ChannelStatus, QrPayload } from "./channels/types.ts";
 import { deliverLoginQr as deliverLoginQrTo, deliverLoginQrFallback as deliverLoginQrFallbackTo, type LoginUiPort } from "./login-ui.ts";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -69,6 +70,8 @@ export interface RelayHost {
   configWatchTimer?: NodeJS.Timeout;
   /** config.json 热加载：上一次已知内容的哈希 */
   configWatchHash?: string;
+  /** 上一次各通道的连接状态，用来识别「刚刚上线」 */
+  lastChannelState?: Map<string, string>;
 }
 
 const HOST_SLOT = "__piImRelayHost";
@@ -208,12 +211,32 @@ export function activeBinding(host: RelayHost): SessionBinding | undefined {
 
 function registerChannels(host: RelayHost): void {
   const { config, router } = host;
+
+  /**
+   * 通道「刚刚连上」时把记忆缓存丢掉。
+   *
+   * 用户的要求是「第一次登录或者新会话时先读一遍聊天记录」。登录成功的瞬间
+   * 正是这个时机：此刻缓存里不可能有刚登录后的聊天记录，所以主动失效，
+   * 让下一条进来的消息重新拉一遍。
+   */
+  const onStatus = (status: ChannelStatus): void => {
+    const prev = host.lastChannelState?.get(status.id);
+    host.lastChannelState = host.lastChannelState ?? new Map();
+    host.lastChannelState.set(status.id, status.state);
+    if (prev !== "online" && status.state === "online") {
+      resetMemoryCache();
+      router.markMemoryStale();
+      log.info(`${status.name} 刚上线，记忆缓存已失效（下一条消息会重新读聊天记录）`);
+    }
+    router.handleChannelStatus(status);
+  };
+
   router.registerChannel(
     new QqChannel(
       config.channels.qq,
       {
         onMessage: (message) => router.accept(message),
-        onStatusChange: (status) => router.handleChannelStatus(status),
+        onStatusChange: onStatus,
         onLoginQr: (payload) => deliverLoginQr(host, payload),
         onLoginQrFallback: (url) => deliverLoginQrFallback(host, url, "QQ登录"),
       },
@@ -225,7 +248,7 @@ function registerChannels(host: RelayHost): void {
       config.channels.wechat,
       {
         onMessage: (message) => router.accept(message),
-        onStatusChange: (status) => router.handleChannelStatus(status),
+        onStatusChange: onStatus,
         onPrompt: (question) => router.handleChannelPrompt(question),
         onLoginQr: (payload) => deliverLoginQr(host, payload),
         onLoginQrFallback: (url) => deliverLoginQrFallback(host, url, "微信登录"),

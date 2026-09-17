@@ -62,6 +62,10 @@ function makeHarness(configPatch: (c: ImRelayConfig) => void = () => {}): Harnes
   const config: ImRelayConfig = structuredClone(DEFAULT_CONFIG);
   config.channels.qq.allowUsers = ["1001"];
   config.channels.qq.allowGroups = ["555"];
+  // 默认关掉记忆注入：开了之后每条消息都会去读 QQ 空间与聊天记录，
+  // 单测不该打真实网络（而且会被腾讯返回 403，测试变慢又不稳）。
+  // 需要测记忆的用例在自己的 configPatch 里重新打开。
+  config.memory.enabled = false;
   configPatch(config);
 
   let idle = true;
@@ -402,4 +406,87 @@ test("carryOver 也会把排队中的消息带过去", async () => {
   assert.equal(carry.queue.length, 1, "排队中的消息应当被带过去而不是丢掉");
   assert.equal(carry.queue[0]?.inbound.text, "第二条");
   assert.equal(carry.lastTargets.length, 1, "最近可回复目标也要带走");
+});
+
+/* ------------------- 记忆注入的节流策略 ------------------- */
+
+test("记忆只在「该发」的时候注入：新会话必发，之后每隔 N 条补发", async () => {
+  const h = makeHarness((c) => {
+    c.memory.enabled = true;
+    c.memory.refreshEveryMessages = 3;
+    c.memory.cacheSeconds = 3600;
+  });
+  // 给通道挂一个假的 OneBot 接口，让 buildNotes 能读到「记忆」
+  let reads = 0;
+  const channel = h.router.channel("qq") as unknown as {
+    api: (action: string) => Promise<unknown>;
+  };
+  channel.api = async (action: string) => {
+    if (action === "get_login_info") return { user_id: 1001 };
+    if (action === "get_friends_with_category") return {};
+    if (action === "get_cookies") return { cookies: "skey=x", bkn: "1" };
+    if (action === "get_friend_msg_history") {
+      reads += 1;
+      return { messages: [] };
+    }
+    return {};
+  };
+
+  await h.router.accept(h.inbound({ text: "第一条" }));
+  await h.settle();
+  assert.match(h.injected.at(-1)?.text ?? "", /## 工作约定/, "新会话/首次必须注入完整记忆");
+
+  await h.router.accept(h.inbound({ text: "第二条" }));
+  await h.settle();
+  assert.doesNotMatch(h.injected.at(-1)?.text ?? "", /## 工作约定/, "紧接着的第二条不该再塞一遍（省 token）");
+
+  // refreshEveryMessages=3：第 3 条时 count 正好到 3，应当补发
+  await h.router.accept(h.inbound({ text: "第三条" }));
+  await h.settle();
+  assert.match(h.injected.at(-1)?.text ?? "", /## 工作约定/, "每 N 条应当补发一次，防止上下文压缩后失忆");
+
+  await h.router.accept(h.inbound({ text: "第四条" }));
+  await h.settle();
+  assert.doesNotMatch(h.injected.at(-1)?.text ?? "", /## 工作约定/, "补发之后要重新计时");
+  assert.ok(reads >= 1, "应当真的去读了聊天记录");
+});
+
+test("markMemoryStale 之后下一条会重新完整注入（新会话/刚登录的语义）", async () => {
+  const h = makeHarness((c) => {
+    c.memory.enabled = true;
+    c.memory.refreshEveryMessages = 0; // 关掉周期性补发，只验证 dirty 这条路径
+    c.memory.cacheSeconds = 3600;
+  });
+  const channel = h.router.channel("qq") as unknown as { api: (action: string) => Promise<unknown> };
+  channel.api = async (action: string) => {
+    if (action === "get_login_info") return { user_id: 1001 };
+    if (action === "get_cookies") return { cookies: "skey=x", bkn: "1" };
+    return {};
+  };
+
+  await h.router.accept(h.inbound({ text: "第一条" }));
+  await h.settle();
+  assert.match(h.injected.at(-1)?.text ?? "", /## 工作约定/);
+
+  await h.router.accept(h.inbound({ text: "第二条" }));
+  await h.settle();
+  assert.doesNotMatch(h.injected.at(-1)?.text ?? "", /## 工作约定/, "refreshEveryMessages=0 时不该周期补发");
+
+  h.router.markMemoryStale();
+  await h.router.accept(h.inbound({ text: "第三条" }));
+  await h.settle();
+  assert.match(h.injected.at(-1)?.text ?? "", /## 工作约定/, "标记之后必须重新注入");
+});
+
+test("重载会接住记忆节流状态，不因为 reload 就白刷一次", async () => {
+  const h = makeHarness((c) => {
+    c.memory.enabled = true;
+    c.memory.refreshEveryMessages = 100;
+  });
+  const carry = h.router.carryOver();
+  assert.equal(typeof carry.memoryCount, "number");
+  assert.equal(carry.memoryDirty, true, "全新 router 初始应当是「需要注入」");
+  h.router.markMemoryStale();
+  const carry2 = h.router.carryOver();
+  assert.equal(carry2.memoryDirty, true);
 });
