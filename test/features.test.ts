@@ -478,3 +478,120 @@ test("probePort 能区分「有服务」与「没服务」", async () => {
   // 关掉之后应当探测失败（拿一个刚释放的高位端口，避免撞上别的服务）
   assert.equal(await probePort("127.0.0.1", 1, 500), false);
 });
+
+/* --------------------- QQ 经营：每日空间总结 --------------------- */
+
+const { parseAt, nextRunAt, buildDigestPrompt, runDigestOnce } = await import(
+  "../extensions/im-relay/digest.ts"
+);
+type DigestConfig = typeof DEFAULT_CONFIG.qzone.digest;
+
+const digestCfg = (patch: Partial<DigestConfig> = {}): DigestConfig => ({
+  ...structuredClone(DEFAULT_CONFIG.qzone.digest),
+  ...patch,
+});
+
+function makeDigestDeps(opts: {
+  cfg?: Partial<DigestConfig>;
+  online?: boolean;
+  material?: string;
+  materialThrows?: boolean;
+}) {
+  const enqueued: string[] = [];
+  return {
+    enqueued,
+    deps: {
+      config: () => digestCfg(opts.cfg),
+      isOnline: () => opts.online ?? true,
+      material: async () => {
+        if (opts.materialThrows) throw new Error("napcat down");
+        return opts.material ?? "";
+      },
+      enqueue: (text: string) => {
+        enqueued.push(text);
+        return true;
+      },
+    },
+  };
+}
+
+test("每日总结的时间解析：合法值直接用，非法值回退到 22:00 而不是崩掉", () => {
+  assert.deepEqual(parseAt("22:00"), { hour: 22, minute: 0 });
+  assert.deepEqual(parseAt(" 7:05 "), { hour: 7, minute: 5 });
+  assert.deepEqual(parseAt("25:00"), { hour: 22, minute: 0 });
+  assert.deepEqual(parseAt("abc"), { hour: 22, minute: 0 });
+  assert.deepEqual(parseAt(""), { hour: 22, minute: 0 });
+});
+
+test("下次触发时刻：今天还没到就今天，已经过了就明天", () => {
+  const at = "22:00";
+  const morning = new Date(2026, 8, 17, 9, 30, 0);
+  const n1 = nextRunAt(at, morning);
+  assert.equal(n1.getDate(), 17);
+  assert.equal(n1.getHours(), 22);
+  assert.equal(n1.getMinutes(), 0);
+
+  const night = new Date(2026, 8, 17, 22, 30, 0);
+  const n2 = nextRunAt(at, night);
+  assert.equal(n2.getDate(), 18, "过了点就该排到第二天");
+  assert.equal(n2.getHours(), 22);
+
+  // 正好等于触发时刻 → 也该排到明天，避免立刻又触发一次
+  const exact = new Date(2026, 8, 17, 22, 0, 0);
+  assert.equal(nextRunAt(at, exact).getDate(), 18);
+});
+
+test("任务描述里写清了做法与可见范围", () => {
+  const p = buildDigestPrompt("22:00", 16, ["10001"]);
+  assert.match(p, /im_relay_recent_chat/, "要告诉它素材从哪来");
+  assert.match(p, /im_relay_render_card/, "要告诉它怎么配图");
+  assert.match(p, /im_relay_qzone_post/, "要告诉它怎么发");
+  assert.match(p, /10001/, "可见范围要带上号主");
+  assert.match(p, /不要凭空编|不要编造/, "必须禁止编造素材");
+  assert.match(p, /不要写成工作报告/, "必须明确「要有趣」而不是流水账");
+});
+
+test("到点但 QQ 不在线 → 跳过，不硬发", async () => {
+  const h = makeDigestDeps({ online: false, material: "有内容" });
+  assert.equal(await runDigestOnce(h.deps), "skipped-offline");
+  assert.equal(h.enqueued.length, 0);
+});
+
+test("今天没人说话 → 跳过（不刷「今日无事」）", async () => {
+  const h = makeDigestDeps({ online: true, material: "" });
+  assert.equal(await runDigestOnce(h.deps), "skipped-idle");
+  assert.equal(h.enqueued.length, 0);
+});
+
+test("读素材失败不抛错，而是当成「今天没内容」处理", async () => {
+  const h = makeDigestDeps({ online: true, materialThrows: true });
+  assert.equal(await runDigestOnce(h.deps), "skipped-idle");
+});
+
+test("条件都满足时会把任务交给 agent", async () => {
+  const h = makeDigestDeps({ online: true, material: "[12:00] 百步飞剑: 帮我改个东西" });
+  assert.equal(await runDigestOnce(h.deps), "sent");
+  assert.equal(h.enqueued.length, 1);
+  assert.match(h.enqueued[0]!, /每日空间总结/);
+});
+
+test("关掉开关之后什么都不做", async () => {
+  const h = makeDigestDeps({ cfg: { enabled: false }, online: true, material: "有内容" });
+  assert.equal(await runDigestOnce(h.deps), "disabled");
+  assert.equal(h.enqueued.length, 0);
+});
+
+test("允许「不在线也照样发」：skipWhenOffline=false 时不看通道状态", async () => {
+  const h = makeDigestDeps({ cfg: { skipWhenOffline: false }, online: false, material: "有内容" });
+  assert.equal(await runDigestOnce(h.deps), "sent");
+});
+
+test("没有任何会话目标时如实返回 no-target，而不是假装发成功", async () => {
+  const deps = {
+    config: () => digestCfg(),
+    isOnline: () => true,
+    material: async () => "有内容",
+    enqueue: () => false,
+  };
+  assert.equal(await runDigestOnce(deps), "no-target");
+});

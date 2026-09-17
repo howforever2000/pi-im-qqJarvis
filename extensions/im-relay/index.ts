@@ -24,7 +24,8 @@ import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CONFIG_FILE, DATA_DIR, LOG_FILE } from "./config.ts";
 import { closeLog, createLogger, errorText } from "./log.ts";
-import { renderPdf } from "./pdf.ts";
+import { renderPdf, renderScreenshot } from "./pdf.ts";
+import { formatChatLines, readRecentChat } from "./chatlog.ts";
 import { resetMemoryCache } from "./memory.ts";
 import {
   ensureHost,
@@ -36,6 +37,7 @@ import {
   activeBinding,
   pushStatus,
   reloadHost,
+  runDigestNow,
   saveHostConfig,
   scheduleHostShutdown,
   cancelHostShutdown,
@@ -490,6 +492,141 @@ export default function imRelay(pi: ExtensionAPI): void {
     },
   });
 
+  /* ------------------------- QQ 账号经营 ------------------------- */
+
+  pi.registerTool({
+    name: "im_relay_qzone_post",
+    label: "发 QQ 空间说说",
+    description:
+      "在机器人自己的 QQ 空间发布一条说说，可选配图。可见范围默认取配置里的 qzone.digest.ugcRight" +
+      "（默认 16 + 号主，即「部分好友可见 → 仅号主」）。图文类说说请先用 im_relay_render_card 做图。",
+    promptSnippet: "在自己的 QQ 空间发一条说说",
+    promptGuidelines: [
+      "发空间内容前先确认可见范围符合隐私约定；默认只对号主可见，不要未经允许改成公开。",
+    ],
+    parameters: Type.Object({
+      content: Type.String({ description: "说说正文" }),
+      images: Type.Optional(
+        Type.Array(Type.String(), { description: "图片路径数组（本机绝对路径），最多 9 张" }),
+      ),
+      ugcRight: Type.Optional(
+        Type.Number({ description: "可见范围：1 所有人 / 4 好友 / 16 部分好友 / 64 仅自己；默认取配置" }),
+      ),
+      targetUins: Type.Optional(
+        Type.Array(Type.String(), { description: "ugcRight 为 16 时可见的好友号；留空用配置里的号主" }),
+      ),
+    }),
+    async execute(_toolCallId, params) {
+      const text = (s: string) => ({ content: [{ type: "text" as const, text: s }], details: {} });
+      const h = host();
+      if (!h) return text("pi-im-relay 未启动。");
+      const call = h.router.channel("qq")?.api;
+      if (!call) return text("QQ 通道没有协议接口（NapCat 未连接），发不了空间。");
+
+      const digest = h.config.qzone.digest;
+      const ugcRight = params.ugcRight ?? digest.ugcRight;
+      const targets =
+        params.targetUins ?? (digest.targetUins.length ? digest.targetUins : h.config.channels.qq.allowUsers);
+
+      const images: string[] = [];
+      for (const p of (params.images ?? []).slice(0, 9)) {
+        const abs = path.resolve(p);
+        if (!fs.existsSync(abs)) return text(`图片不存在：${abs}`);
+        images.push(`file:///${abs.replace(/\\/g, "/").replace(/^\/+/, "")}`);
+      }
+
+      try {
+        const res = await call<{ tid?: string }>("send_qzone_msg", {
+          content: params.content,
+          ...(images.length ? { images } : {}),
+          ugc_right: ugcRight,
+          ...(ugcRight === 16 || ugcRight === 128 ? { target_uins: targets } : {}),
+        });
+        const vis = ugcRight === 16 ? `部分好友可见（${targets.join("、")}）` : `ugc_right=${ugcRight}`;
+        log.info(`已发布空间说说 tid=${res?.tid ?? "?"}（${vis}）`);
+        return text(`已发布到 QQ 空间。tid：${res?.tid ?? "(未返回)"}，可见范围：${vis}`);
+      } catch (error) {
+        return text(`发说说失败：${errorText(error)}`);
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "im_relay_render_card",
+    label: "把 HTML 渲染成卡片图",
+    description:
+      "把一段 HTML/CSS 渲染成 PNG 图片（用浏览器无头截图）。用于给空间说说配图：" +
+      "自己写 HTML 排版比描述给文生图模型更可控 —— 颜色、字号、间距都是精确值。" +
+      "建议尺寸：竖向卡片 1080×1350，方图 1080×1080。",
+    promptSnippet: "用 HTML+CSS 渲染一张排版卡片图（用于空间配图）",
+    promptGuidelines: [
+      "做卡片图时把文字写大、信息量压少 —— 缩到手机上看要一眼能读。",
+      "配色建议用深色底 + 一个亮色重点，避免大面积浅色。",
+    ],
+    parameters: Type.Object({
+      html: Type.String({ description: "完整 HTML（内联样式）" }),
+      width: Type.Number({ description: "像素宽，如 1080" }),
+      height: Type.Number({ description: "像素高，如 1350" }),
+      fileName: Type.Optional(Type.String({ description: "输出文件名（不含路径与扩展名）" })),
+    }),
+    async execute(_toolCallId, params) {
+      const text = (s: string) => ({ content: [{ type: "text" as const, text: s }], details: {} });
+      const safe = (params.fileName ?? `card-${Date.now()}`).replace(/[\\/:*?"<>|]/g, "_").slice(0, 60);
+      const workDir = path.join(DATA_DIR, "tmp", "cards");
+      fs.mkdirSync(workDir, { recursive: true });
+      const htmlPath = path.join(workDir, `${safe}.html`);
+      const pngPath = path.join(workDir, `${safe}.png`);
+      fs.writeFileSync(htmlPath, params.html, "utf8");
+      try {
+        renderScreenshot(htmlPath, pngPath, params.width, params.height, h?.config.pdf.browser ?? "");
+      } catch (error) {
+        return text(`渲染卡片失败：${errorText(error)}`);
+      }
+      const size = fs.statSync(pngPath).size;
+      log.info(`已渲染卡片 ${pngPath}（${params.width}×${params.height}, ${formatBytes(size)}）`);
+      return text(`卡片已生成：${pngPath}（${params.width}×${params.height}）`);
+    },
+  });
+
+  pi.registerTool({
+    name: "im_relay_recent_chat",
+    label: "读最近的 IM 聊天记录",
+    description:
+      "读回最近的 QQ 聊天记录（含双向，「我」指机器人）。用于写日志/总结时回看发生了什么 —— " +
+      "这是唯一可靠的素材来源，不要凭记忆编造。默认读号主私聊。",
+    promptSnippet: "读最近的 QQ 聊天记录作为素材",
+    parameters: Type.Object({
+      count: Type.Optional(Type.Number({ description: "条数，默认 60" })),
+      peer: Type.Optional(Type.String({ description: "对方 QQ 号；留空用白名单里的号主" })),
+      todayOnly: Type.Optional(Type.Boolean({ description: "只保留今天的内容，默认 false" })),
+    }),
+    async execute(_toolCallId, params) {
+      const text = (s: string) => ({ content: [{ type: "text" as const, text: s }], details: {} });
+      const h = host();
+      if (!h) return text("pi-im-relay 未启动。");
+      const channel = h.router.channel("qq");
+      const call = channel?.api;
+      if (!call) return text("QQ 通道没有协议接口，读不了记录。");
+      const peer = params.peer?.trim() || h.config.channels.qq.allowUsers[0];
+      if (!peer) return text("不知道读谁的：白名单为空，也没指定 peer。");
+
+      const res = await readRecentChat(
+        (action, p) => call.call(channel, action, p),
+        { kind: "private", id: peer, count: params.count ?? 60 },
+      );
+      if (res.error) return text(`读聊天记录失败：${res.error}`);
+
+      let lines = res.lines;
+      if (params.todayOnly) {
+        const start = new Date();
+        start.setHours(0, 0, 0, 0);
+        lines = lines.filter((l) => l.at >= start.getTime());
+      }
+      if (!lines.length) return text("没有记录（或今天还没有对话）。");
+      return text(`共 ${lines.length} 条（对端 ${peer}）：\n\n${formatChatLines(lines, 8000)}`);
+    },
+  });
+
   /* ------------------------- 控制命令 ------------------------- */
 
   /* ------------------------- 控制命令 ------------------------- */
@@ -586,12 +723,22 @@ export default function imRelay(pi: ExtensionAPI): void {
         case "log":
           ctx.ui?.notify(`日志：${LOG_FILE}`, "info");
           return;
+        case "digest": {
+          if (!h) {
+            ctx.ui?.notify("IM relay 未启动", "warning");
+            return;
+          }
+          ctx.ui?.notify("正在跑一次每日空间总结 …", "info");
+          const result = await runDigestNow(h);
+          ctx.ui?.notify(result, "info");
+          return;
+        }
         case "dir":
           ctx.ui?.notify(`数据目录：${DATA_DIR}`, "info");
           return;
         default:
           ctx.ui?.notify(
-            `未知子命令：${sub}。可用：status / sessions / attach / detach / login / qr / qr-hide / on / off / reload / test / log / dir`,
+            `未知子命令：${sub}。可用：status / sessions / attach / detach / login / qr / qr-hide / on / off / reload / digest / test / log / dir`,
             "warning",
           );
       }

@@ -106,6 +106,59 @@ export function renderPdf(markdown: string, options: RenderOptions): string {
   return options.output;
 }
 
+/**
+ * 把 HTML 渲染成 PNG 卡片图（空间说说配图用）。
+ *
+ * 为什么不用文生图模型：排版卡片需要的是**精确的**颜色、字号、间距，
+ * 自己写 HTML/CSS 反复调比用自然语言描述给模型可靠得多，而且改一个色号只要两秒。
+ * 这条路线在浏览器无头模式下顺手就能做，不需要额外依赖。
+ */
+export function renderScreenshot(
+  htmlPath: string,
+  output: string,
+  width: number,
+  height: number,
+  configuredBrowser = "",
+): string {
+  const browser = findBrowser(configuredBrowser);
+  if (!browser) throw new Error("找不到 Chrome / Edge（可用 pdf.browser 配置或 CHROME_PATH 环境变量指定）");
+
+  fs.mkdirSync(path.dirname(output), { recursive: true });
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), "pi-im-relay-shot-"));
+  const url = `file:///${htmlPath.replace(/\\/g, "/").replace(/^\/+/, "")}`;
+  const args = [
+    "--headless=new",
+    "--disable-gpu",
+    "--hide-scrollbars",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-extensions",
+    `--user-data-dir=${profile}`,
+    `--window-size=${Math.round(width)},${Math.round(height)}`,
+    `--screenshot=${output}`,
+    url,
+  ];
+  const r = spawnSync(browser, args, { encoding: "utf8", timeout: 120_000 });
+  if (r.error) throw new Error(`调用浏览器失败：${errorText(r.error)}`);
+
+  let size = 0;
+  try {
+    size = fs.statSync(output).size;
+  } catch {
+    size = 0;
+  }
+  try {
+    fs.rmSync(profile, { recursive: true, force: true });
+  } catch {
+    /* ignore */
+  }
+  // 同样不信任退出码，以文件为准
+  if (size < 500) {
+    throw new Error(`截图失败（${size} 字节）。stderr=${(r.stderr ?? "").slice(0, 200)}`);
+  }
+  return output;
+}
+
 /** 正文是否「长到该走 PDF」。 */
 export function shouldUsePdf(text: string, threshold: number): boolean {
   if (threshold <= 0) return false;

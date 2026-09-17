@@ -26,6 +26,8 @@ import { WechatChannel } from "./channels/wechat.ts";
 import { DATA_DIR, loadConfig, saveConfig, type ImRelayConfig } from "./config.ts";
 import { startConfigWatch, stopConfigWatch, syncConfigWatch } from "./watch.ts";
 import { resetMemoryCache } from "./memory.ts";
+import { startQzoneDigest, stopQzoneDigest, runDigestOnce } from "./digest.ts";
+import { formatChatLines, readRecentChat } from "./chatlog.ts";
 import type { ChannelStatus, QrPayload } from "./channels/types.ts";
 import { deliverLoginQr as deliverLoginQrTo, deliverLoginQrFallback as deliverLoginQrFallbackTo, type LoginUiPort } from "./login-ui.ts";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -142,7 +144,56 @@ export async function ensureHost(pi: ExtensionAPI, ctx: ExtensionContext): Promi
   // 配置热加载：改了 config.json 就自动 reload，不用再手敲 /im reload
   ensureConfigWatch(host);
 
+  // QQ 账号经营：每天定时把当天内容整理成一条空间说说
+  // 依赖全部写成「懒读取 host.xxx」，这样 reloadHost 换了 router 也不用重新注册
+  startQzoneDigest(digestDeps(host));
+
   return host;
+}
+
+/** 定时总结的依赖集合。抽出来是为了让 `/im digest` 能用同一套逻辑立刻跑一次。 */
+function digestDeps(host: RelayHost): import("./digest.ts").DigestDeps {
+  return {
+    config: () => host.config.qzone.digest,
+    isOnline: (channelId) => host.router.channel(channelId)?.status().state === "online",
+    material: () => collectTodayMaterial(host),
+    enqueue: (text) => host.router.enqueueScheduled(text),
+  };
+}
+
+/** 供 `/im digest` 使用：立刻跑一次每日总结，并给出人可读结果。 */
+export async function runDigestNow(host: RelayHost): Promise<string> {
+  const outcome = await runDigestOnce(digestDeps(host));
+  const map: Record<string, string> = {
+    disabled: "每日总结在配置里被关闭了（qzone.digest.enabled = false）",
+    "skipped-offline": "QQ 通道不在线，已跳过（要强制跑可把 skipWhenOffline 设为 false）",
+    "skipped-idle": "今天还没有任何对话，没有可总结的内容，已跳过",
+    "no-target": "没有可用的会话目标：白名单为空且从未收到过 QQ 消息",
+    sent: "已把「写今天的空间总结」交给 agent，它会在跑完后回报结果",
+  };
+  return map[outcome] ?? outcome;
+}
+
+/**
+ * 取「今天的对话」作为写总结的素材。
+ *
+ * 只读号主私聊（不是群），只看今天（零点之后）。读不到就返回空串 ——
+ * 上层据此判断「今天没人说话」并跳过。
+ */
+async function collectTodayMaterial(host: RelayHost): Promise<string> {
+  const channel = host.router.channel("qq");
+  const call = channel?.api;
+  const peer = host.config.channels.qq.allowUsers[0];
+  if (!call || !peer) return "";
+  const res = await readRecentChat(
+    (action, params) => call.call(channel, action, params),
+    { kind: "private", id: peer, count: host.config.qzone.digest.materialCount },
+  );
+  if (res.error) throw new Error(res.error);
+  const start = new Date();
+  start.setHours(0, 0, 0, 0);
+  const today = res.lines.filter((l) => l.at >= start.getTime());
+  return today.length ? formatChatLines(today, 6000) : "";
 }
 
 /**
@@ -549,10 +600,13 @@ export async function reloadHost(host: RelayHost): Promise<void> {
   }
   // 重载完成后对齐基线，避免刚重载完又被自己的写入触发一次循环
   syncConfigWatch(host);
+  // 重载可能改了定时时间，重新排一次（startQzoneDigest 会先停旧的）
+  startQzoneDigest(digestDeps(host));
   pushStatus(host);
 }
 
 export function shutdownHost(host: RelayHost): void {
+  stopQzoneDigest();
   stopConfigWatch(host);
   host.chatMap.dispose();
   if (host.lock.ok) releaseProcessLock(host.lock.file);

@@ -167,6 +167,32 @@ export interface PdfConfig {
   browser: string;
 }
 
+/**
+ * QQ 账号经营：定时把当天的内容整理成一条空间说说发出去。
+ *
+ * 这是「把 QQ 号当成 agent 的家」这个思路的延伸 —— 不只是被动收发消息，
+ * 而是让它每天自己写给自己的日志。写下的东西又会被记回上下文，形成闭环。
+ */
+export interface QzoneDigestConfig {
+  enabled: boolean;
+  /** 每天什么时候跑，本地时间 `HH:MM` */
+  at: string;
+  /** 到点时 QQ 通道不在线就跳过（没登录就没必要折腾） */
+  skipWhenOffline: boolean;
+  /** 今天一条对话都没有就跳过（避免刷出一堆“今天无事发生”） */
+  skipWhenIdle: boolean;
+  /** 交给模型的聊天记录条数上限 */
+  materialCount: number;
+  /** 默认可见范围（1 所有人 / 4 好友 / 16 部分好友 / 64 仅自己） */
+  ugcRight: number;
+  /** 可见范围为 16/128 时的目标好友；留空则用 `channels.qq.allowUsers` */
+  targetUins: string[];
+}
+
+export interface QzoneConfig {
+  digest: QzoneDigestConfig;
+}
+
 export interface ImRelayConfig {
   /** 总开关；可用 /im-relay off 临时关闭 */
   enabled: boolean;
@@ -183,6 +209,7 @@ export interface ImRelayConfig {
   album: AlbumConfig;
   memory: MemoryConfig;
   pdf: PdfConfig;
+  qzone: QzoneConfig;
   channels: {
     qq: QqConfig;
     wechat: WechatConfig;
@@ -218,6 +245,17 @@ export const DEFAULT_CONFIG: ImRelayConfig = {
     enabled: true,
     threshold: 300,
     browser: "",
+  },
+  qzone: {
+    digest: {
+      enabled: true,
+      at: "22:00",
+      skipWhenOffline: true,
+      skipWhenIdle: true,
+      materialCount: 200,
+      ugcRight: 16,
+      targetUins: [],
+    },
   },
   channels: {
     qq: {

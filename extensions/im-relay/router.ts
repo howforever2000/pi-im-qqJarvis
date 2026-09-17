@@ -224,6 +224,64 @@ export class ImRelayRouter {
     return every > 0 && this.memoryCount > 0 && this.memoryCount % every === 0;
   }
 
+  /**
+   * 由定时任务触发的注入。
+   *
+   * 为什么走「排一个 job」而不是直接注入：
+   *   - 走 job 才能带上垫话（工作约定 + 记忆 + 相册回执）
+   *   - 而且 agent 跑完的结果有地方回 —— 直接注入的话 current 为空，
+   *     onSettled() 会直接跳过，用户看不到任何反馈
+   *
+   * 目标优先用「最近跟我说过话的那个 QQ 会话」，没有就回退到白名单里的第一个号。
+   */
+  enqueueScheduled(text: string, notes: string[] = []): boolean {
+    if (this.stopping || !this.config.enabled) return false;
+    const target = this.lastTargets.get("qq") ?? this.ownerTarget();
+    if (!target) {
+      log.warn("定时任务没有可用的 QQ 目标（白名单为空且从未收到过 QQ 消息）");
+      return false;
+    }
+
+    const senderId = String((target.route as { userId?: string } | undefined)?.userId ?? "scheduler");
+    const inbound: InboundMessage = {
+      channel: target.channel,
+      chatId: target.chatId,
+      conversationKey: target.conversationKey,
+      senderId,
+      senderName: "计划任务",
+      label: `${target.label}（定时任务）`,
+      isGroup: false,
+      text,
+      images: [],
+      dedupeKey: `scheduled:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
+      receivedAt: Date.now(),
+      target,
+    };
+
+    this.lastTargets.set(inbound.channel, target);
+    if (this.queue.length >= this.config.queueLimit) {
+      const dropped = this.queue.shift();
+      if (dropped) log.warn(`队列已满，丢弃最旧消息（${dropped.inbound.label}）`);
+    }
+    this.queue.push({ inbound, queuedAt: Date.now(), notes });
+    log.info(`定时任务已入队：${target.label}`);
+    this.pump();
+    return true;
+  }
+
+  /** 从白名单推一个号主私聊目标（用于定时任务，哪怕对方还没发过消息）。 */
+  private ownerTarget(): ChatTarget | undefined {
+    const uin = this.config.channels.qq.allowUsers[0];
+    if (!uin) return undefined;
+    return {
+      channel: "qq",
+      chatId: `private:${uin}`,
+      conversationKey: `qq:user:${uin}`,
+      label: `QQ 私聊 ${uin}`,
+      route: { userId: uin },
+    };
+  }
+
   /** 由通道回调：状态变化。 */
   handleChannelStatus(status: ChannelStatus): void {
     this.statuses.set(status.id, status);
