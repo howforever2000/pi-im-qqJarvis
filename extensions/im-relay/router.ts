@@ -13,8 +13,12 @@
  */
 import { createLogger, errorText } from "./log.ts";
 import { ChatMapStore } from "./store.ts";
-import { DedupeSet, RateLimiter, humanAge } from "./text.ts";
+import { DedupeSet, RateLimiter, formatBytes, humanAge } from "./text.ts";
 import { normalizeTrigger } from "./triggers.ts";
+import { DATA_DIR } from "./config.ts";
+import { deriveReplyTitle, renderReplyPdf, shouldUsePdf } from "./pdf.ts";
+import fs from "node:fs";
+import path from "node:path";
 import { saveInboundImages } from "./album.ts";
 import { buildMemory } from "./memory.ts";
 import type { ImRelayConfig } from "./config.ts";
@@ -26,6 +30,18 @@ const PROGRESS_THROTTLE_MS = 5000;
 const MAX_INJECT_RETRIES = 6;
 /** 同一会话的「忙时回执」最短间隔 —— 连发追问不能变成刷屏 */
 const BUSY_ACK_THROTTLE_MS = 60_000;
+
+/**
+ * 给测试留的注入点。
+ *
+ * 为什么需要：自动转 PDF 会真去调 headless Chrome（几秒 + 依赖浏览器装没装）。
+ * 仓库现有测试刻意避开了真实渲染（只测 shouldUsePdf 这类纯判定），加个注入点
+ * 就能把「什么时候转 PDF / 转失败怎么办」这段**链路逻辑**单测掉，
+ * 而不必把浏览器变成测试套件的前置依赖。生产路径不传就用真实渲染。
+ */
+export interface RouterOverrides {
+  renderReplyPdf?(markdown: string, options: { title: string; dir: string; browser?: string }): string;
+}
 
 export interface PiPort {
   /** pi 当前是否空闲（可以接受新的 prompt） */
@@ -103,6 +119,7 @@ export class ImRelayRouter {
    */
   private readonly busyAckedAt = new Map<string, number>();
   private pendingControl: { target: ChatTarget; label: string } | undefined;
+  private readonly overrides: RouterOverrides;
   /** 最近一次发起 turn 的目标，用于本地输入镜像 */
   private lastTarget: ChatTarget | undefined;
   /**
@@ -127,10 +144,11 @@ export class ImRelayRouter {
   private readonly deps: PiPort;
   private readonly chatMap: ChatMapStore;
 
-  constructor(config: ImRelayConfig, deps: PiPort, chatMap: ChatMapStore) {
+  constructor(config: ImRelayConfig, deps: PiPort, chatMap: ChatMapStore, overrides: RouterOverrides = {}) {
     this.config = config;
     this.deps = deps;
     this.chatMap = chatMap;
+    this.overrides = overrides;
     this.rateLimiter = new RateLimiter(config.rateLimitPerMinute);
   }
 
@@ -596,7 +614,7 @@ export class ImRelayRouter {
     if (job) {
       const text = this.buildFinalReply(job.inbound);
       this.current = undefined;
-      void this.replyRaw(job.inbound.target, text).catch((error) => {
+      void this.deliverFinal(job.inbound, text).catch((error) => {
         log.warn(`回复 ${job.inbound.label} 失败: ${errorText(error)}`);
         this.deps.notify(`回复 ${job.inbound.label} 失败：${errorText(error)}`, "warning");
       });
@@ -604,6 +622,51 @@ export class ImRelayRouter {
     // 让 pi 先完全回到空闲，再提交下一条
     const timer = setTimeout(() => this.pump(), 50);
     timer.unref?.();
+  }
+
+  /**
+   * 把最终答复发回去 —— 长文/表格自动改走 PDF。
+   *
+   * 为什么要有这一步：项目约定（AGENT.md）写着「结论超过 300 字或含表格 → 发 PDF，
+   * 聊天里只留一段简短说明」，但那一直只是**给模型看的提醒** —— 模型忘了就退化成
+   * 手机上刷屏长文。pdf.ts 里 shouldUsePdf() 早就写好了，却从来没人调用。
+   * 现在把这条规矩变成插件的硬行为：不再依赖模型自觉。
+   *
+   * 两道安全网：
+   *  1. 通道没有 sendFile（微信侧只做了出站文本）→ 直接发原文；
+   *  2. 渲染或发送任一步失败 → 退回发原文。**任何情况下都不能把消息弄丢。**
+   */
+  private async deliverFinal(inbound: InboundMessage, text: string): Promise<void> {
+    const cfg = this.config.pdf;
+    const channel = this.channels.get(inbound.channel);
+
+    if (cfg.enabled && channel?.sendFile && shouldUsePdf(text, cfg.threshold)) {
+      try {
+        const title = deriveReplyTitle(text);
+        const dir = path.join(DATA_DIR, "tmp", "pdf");
+        const render = this.overrides.renderReplyPdf ?? renderReplyPdf;
+        const file = render(text, { title, dir, browser: cfg.browser });
+        await channel.sendFile(inbound.target, file);
+        // 文件明明已经渲染出来了，读不到大小不该影响发送（统计失败就省掉那个数字）
+        let size = 0;
+        try {
+          size = fs.statSync(file).size;
+        } catch {
+          /* 忽略 */
+        }
+        log.info(`长回复自动转 PDF 已发送 ${file}（${size ? formatBytes(size) : "大小未知"}）→ ${inbound.label}`);
+        const sizeText = size > 0 ? `（${formatBytes(size)}）` : "";
+        await this.replyRaw(
+          inbound.target,
+          `📄 这条内容较长（${text.length} 字），已渲染成 PDF 发给你：${title}${sizeText}`,
+        ).catch(() => undefined);
+        return;
+      } catch (error) {
+        log.warn(`自动转 PDF 失败，退回发纯文本：${errorText(error)}`);
+      }
+    }
+
+    await this.replyRaw(inbound.target, text);
   }
 
   private buildFinalReply(inbound: InboundMessage): string {

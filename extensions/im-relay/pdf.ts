@@ -166,3 +166,42 @@ export function shouldUsePdf(text: string, threshold: number): boolean {
   // 表格在手机上基本没法看，即使不长也建议走 PDF
   return /^\s*\|.*\|\s*$/m.test(text);
 }
+
+/**
+ * 从一段回复里起一个像样的标题（给 PDF 首页与文件名用）。
+ *
+ * 优先取第一个 Markdown 标题；没有就取第一行非空文本。全空时兜个底 ——
+ * 标题不能是空字符串，否则文件名会退化成 ".pdf"。
+ */
+export function deriveReplyTitle(markdown: string, fallback = "回复"): string {
+  const lines = markdown
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+  for (const line of lines) {
+    const heading = /^#{1,6}\s+(.+)$/.exec(line);
+    if (heading?.[1]) return heading[1].trim().slice(0, 40) || fallback;
+  }
+  // 别拿表格行当标题（一排竖线当标题很难看）
+  const first = lines.find((l) => !l.startsWith("|")) ?? lines[0];
+  if (!first) return fallback;
+  return first.replace(/[*_`>#]/g, "").trim().slice(0, 40) || fallback;
+}
+
+/**
+ * 把一段回复渲染成 PDF 文件，返回输出路径。文件名从标题推导并清洗。
+ * 失败时抛错 —— 调用方自己决定要不要退回去发纯文本。
+ */
+export function renderReplyPdf(
+  markdown: string,
+  options: { title: string; dir: string; browser?: string },
+): string {
+  const safe = options.title.replace(/[\\/:*?"<>|]/g, "_").replace(/\s+/g, " ").trim().slice(0, 60) || "reply";
+  const output = path.join(options.dir, `${safe}.pdf`);
+  return renderPdf(markdown, {
+    title: options.title,
+    output,
+    workDir: options.dir,
+    browser: options.browser,
+  });
+}

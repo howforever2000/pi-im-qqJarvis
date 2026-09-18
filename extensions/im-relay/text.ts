@@ -180,3 +180,11 @@ export function humanAge(from: number, now = Date.now()): string {
   if (hours < 48) return `${hours} 小时前`;
   return `${Math.round(hours / 24)} 天前`;
 }
+
+/** 人类可读的文件大小，用于回执与日志。 */
+export function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${kb.toFixed(1)} KB`;
+  return `${(kb / 1024).toFixed(2)} MB`;
+}

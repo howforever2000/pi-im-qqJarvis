@@ -26,6 +26,7 @@ import { CONFIG_FILE, DATA_DIR, LOG_FILE } from "./config.ts";
 import { closeLog, createLogger, errorText } from "./log.ts";
 import { renderPdf, renderScreenshot } from "./pdf.ts";
 import { formatChatLines, readRecentChat } from "./chatlog.ts";
+import { formatBytes } from "./text.ts";
 import { resetMemoryCache } from "./memory.ts";
 import {
   ensureHost,
@@ -899,12 +900,7 @@ function extractText(content: unknown): string {
 }
 
 /** 人类可读的文件大小，只用于工具回执。 */
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  const kb = bytes / 1024;
-  if (kb < 1024) return `${kb.toFixed(1)} KB`;
-  return `${(kb / 1024).toFixed(2)} MB`;
-}
+// 已移到 text.ts（router 也要用），这里改成从那边导入。
 
 /**
  * 列出会话目录里最近的 jsonl 会话。

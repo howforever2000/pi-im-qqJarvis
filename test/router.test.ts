@@ -3,6 +3,7 @@
  */
 import assert from "node:assert/strict";
 import test from "node:test";
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -23,6 +24,10 @@ class FakeChannel implements Channel {
   readonly id = "qq" as const;
   readonly name = "FakeQQ";
   readonly sent: Array<{ target: ChatTarget; text: string }> = [];
+  /** 发出去的文件（自动转 PDF 走这条） */
+  readonly sentFiles: Array<{ target: ChatTarget; file: string }> = [];
+  /** 测试开关：让 sendFile 抛错，用来验证「发送失败不能把消息弄丢」 */
+  failSendFile = false;
   started = false;
   state: ChannelStatus = { id: "qq", name: "FakeQQ", state: "online" };
   readonly hooks: ChannelHooks;
@@ -44,6 +49,11 @@ class FakeChannel implements Channel {
   async send(target: ChatTarget, text: string): Promise<void> {
     this.sent.push({ target, text });
   }
+
+  async sendFile(target: ChatTarget, file: string): Promise<void> {
+    if (this.failSendFile) throw new Error("模拟发送失败");
+    this.sentFiles.push({ target, file });
+  }
 }
 
 interface Harness {
@@ -58,7 +68,10 @@ interface Harness {
   settle(text?: string): Promise<void>;
 }
 
-function makeHarness(configPatch: (c: ImRelayConfig) => void = () => {}): Harness {
+function makeHarness(
+  configPatch: (c: ImRelayConfig) => void = () => {},
+  overrides: Record<string, unknown> = {},
+): Harness {
   const config: ImRelayConfig = structuredClone(DEFAULT_CONFIG);
   config.channels.qq.allowUsers = ["1001"];
   config.channels.qq.allowGroups = ["555"];
@@ -96,7 +109,12 @@ function makeHarness(configPatch: (c: ImRelayConfig) => void = () => {}): Harnes
   };
 
   let hooksRef: ChannelHooks | undefined;
-  const router = new ImRelayRouter(config, deps, new ChatMapStore(path.join(os.tmpdir(), `im-relay-test-${Date.now()}.json`)));
+  const router = new ImRelayRouter(
+    config,
+    deps,
+    new ChatMapStore(path.join(os.tmpdir(), `im-relay-test-${Date.now()}.json`)),
+    overrides as never,
+  );
   const channel = new FakeChannel({
     onMessage: (message) => router.accept(message),
     onStatusChange: (status) => {
@@ -358,6 +376,109 @@ test("回执说过的话要兑现：前一条处理完后，排队的那条会�
   assert.equal(h.injected.length, 2, "排队的第二条最终必须被送给 agent");
   assert.ok(h.channel.sent.some((s) => s.text === "答复A"));
   assert.ok(h.channel.sent.some((s) => s.text === "答复B"));
+});
+
+/* ------------------------------------------------------------------ */
+/* 长回复自动转 PDF                                                    */
+/*                                                                     */
+/* 项目约定（AGENT.md）写着「超 300 字或含表格 → 发 PDF」，但那一直只是 */
+/* 给模型看的提醒；pdf.ts 里的 shouldUsePdf() 写好了却从没被调用。     */
+/* 这里锁住：这条规矩现在是插件的硬行为，不再靠模型自觉。              */
+/* ------------------------------------------------------------------ */
+
+/** 一个假的渲染器：不调浏览器，只把“渲染过什么”记下来，并真的落一个小文件。 */
+function fakeRenderer(log: Array<{ markdown: string; title: string }>) {
+  return (markdown: string, options: { title: string }) => {
+    log.push({ markdown, title: options.title });
+    const file = path.join(os.tmpdir(), `fake-reply-${process.pid}-${log.length}.pdf`);
+    fs.writeFileSync(file, `%PDF-1.4 fake ${markdown.length} bytes`);
+    return file;
+  };
+}
+
+test("长回复自动转成 PDF 发文件，聊天里只留一句简短说明", async () => {
+  const rendered: Array<{ markdown: string; title: string }> = [];
+  const h = makeHarness(() => {}, { renderReplyPdf: fakeRenderer(rendered) });
+
+  await h.router.accept(h.inbound({ text: "你好" }));
+  const long = `# 验收报告\n\n${"这一行是报告正文。".repeat(40)}`;
+  await h.settle(long);
+
+  assert.equal(rendered.length, 1, "长回复应当被送去渲染");
+  assert.equal(rendered[0]?.title, "验收报告", "标题应当从一级标题推导");
+  assert.equal(h.channel.sentFiles.length, 1, "应当作为文件发出去");
+  // 聊天里不能再堆原文，只能留一句说明
+  const note = h.channel.sent.at(-1)?.text ?? "";
+  assert.ok(note.includes("PDF"), `实际：${note}`);
+  assert.ok(note.length < 120, "说明本身必须短");
+  assert.ok(!h.channel.sent.some((s) => s.text === long), "原文不该直接发到聊天里");
+});
+
+test("短回复不转 PDF，直接发文字（不要为了炫技多存一个文件）", async () => {
+  const rendered: Array<{ markdown: string; title: string }> = [];
+  const h = makeHarness(() => {}, { renderReplyPdf: fakeRenderer(rendered) });
+
+  await h.router.accept(h.inbound({ text: "你好" }));
+  await h.settle("好的，已经改完了。");
+
+  assert.equal(rendered.length, 0);
+  assert.equal(h.channel.sentFiles.length, 0);
+  assert.equal(h.channel.sent.at(-1)?.text, "好的，已经改完了。");
+});
+
+test("含表格的短回复也转 PDF（表格在手机上根本没法看）", async () => {
+  const rendered: Array<{ markdown: string; title: string }> = [];
+  const h = makeHarness(() => {}, { renderReplyPdf: fakeRenderer(rendered) });
+
+  await h.router.accept(h.inbound({ text: "你好" }));
+  await h.settle("| 项 | 值 |\n| --- | --- |\n| a | 1 |");
+
+  assert.equal(rendered.length, 1, "含表格就该走 PDF，哪怕不到 300 字");
+  assert.equal(h.channel.sentFiles.length, 1);
+});
+
+test("pdf.enabled=false 时一律发文字（配置能一键关掉）", async () => {
+  const rendered: Array<{ markdown: string; title: string }> = [];
+  const h = makeHarness(
+    (c) => {
+      c.pdf.enabled = false;
+    },
+    { renderReplyPdf: fakeRenderer(rendered) },
+  );
+
+  await h.router.accept(h.inbound({ text: "你好" }));
+  await h.settle(`# 长文\n\n${"正文。".repeat(200)}`);
+
+  assert.equal(rendered.length, 0);
+  assert.ok(h.channel.sent.at(-1)?.text.includes("正文"));
+});
+
+test("渲染失败就退回发纯文本 —— 任何情况下都不能把消息弄丢", async () => {
+  const h = makeHarness(() => {}, {
+    renderReplyPdf: () => {
+      throw new Error("找不到 Chrome / Edge");
+    },
+  });
+
+  await h.router.accept(h.inbound({ text: "你好" }));
+  const long = `# 报告\n\n${"正文。".repeat(200)}`;
+  await h.settle(long);
+
+  assert.equal(h.channel.sentFiles.length, 0);
+  assert.equal(h.channel.sent.at(-1)?.text, long, "原文必须原样发出去");
+});
+
+test("文件发不出去也退回发纯文本（不能只剩一句「已生成」）", async () => {
+  const rendered: Array<{ markdown: string; title: string }> = [];
+  const h = makeHarness(() => {}, { renderReplyPdf: fakeRenderer(rendered) });
+  h.channel.failSendFile = true;
+
+  await h.router.accept(h.inbound({ text: "你好" }));
+  const long = `# 报告\n\n${"正文。".repeat(200)}`;
+  await h.settle(long);
+
+  assert.equal(h.channel.sentFiles.length, 0);
+  assert.equal(h.channel.sent.at(-1)?.text, long, "发送失败必须退回原文，不能只说一句失败");
 });
 
 test("/whoami 回显标识，便于加入白名单", async () => {
