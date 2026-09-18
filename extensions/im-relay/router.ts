@@ -14,6 +14,7 @@
 import { createLogger, errorText } from "./log.ts";
 import { ChatMapStore } from "./store.ts";
 import { DedupeSet, RateLimiter, humanAge } from "./text.ts";
+import { normalizeTrigger } from "./triggers.ts";
 import { saveInboundImages } from "./album.ts";
 import { buildMemory } from "./memory.ts";
 import type { ImRelayConfig } from "./config.ts";
@@ -338,6 +339,29 @@ export class ImRelayRouter {
     const command = parseCommand(inbound.text);
     if (command) {
       await this.handleInboundCommand(inbound, command.name, command.args);
+      return;
+    }
+
+    // IM 侧的自然语言状态入口。
+    //
+    // 为什么需要：IM 消息只有 `/` 开头的才走命令快通道（parseCommand 要求
+    // startsWith("/")），【裸短语一律排队等 agent】。而 agent 一旦卡在长任务里
+    // （派活、跑构建、独立验收），一句「是否在线」就要等几分钟 —— 用户体感就是
+    // 机器人失联。实测就是：三分钟里连问三次状态，三次全在排队。
+    //
+    // 注意别跟 triggers.ts 搞混：那个 matchLocalTrigger 只挂在 pi 的本地 input
+    // 事件上，而且开头的 `event.source === "extension"` 就把 IM 注入的消息排除了；
+    // 它命中后也只是 ctx.ui.notify 弹本地通知，根本不是 IM 回复。
+    //
+    // 这里把「整句就是一个状态短语」的话就地答掉：零 token、零延迟。
+    // 必须整句精确匹配（沿用 normalizeTrigger 的归一化）—— 用包含匹配的话，
+    // 「机器人状态怎么同步到云端」这种正常提问会被劫持。
+    const quick = matchImQuickQuery(inbound.text);
+    // status 类永远就地答（答案纯机械）；progress 类只在 agent 忙时拦截 ——
+    // 空闲时放它过去，那种问题该由 agent 去查真实进展（比如 workbubby 干到哪了），
+    // 只有「本来要等很久」的时候才值得用兜底文案顶一下。
+    if (quick === "status" || (quick === "progress" && !this.deps.isIdle())) {
+      await this.replyRaw(inbound.target, quick === "status" ? this.buildStatusText() : this.buildProgressText());
       return;
     }
 
@@ -741,11 +765,102 @@ export class ImRelayRouter {
     lines.push(`配置：${this.config.enabled ? "已启用" : "已停用"}｜单条上限 ${this.config.maxReplyChars} 字｜限流 ${this.config.rateLimitPerMinute} 条/分钟`);
     return lines.join("\n");
   }
+
+  /**
+   * 忙时的「你在干什么」。
+   *
+   * 全部用 router 手里**已经有**的数据拼出来（当前 job、工具计数、队列），
+   * 不调模型、不查外部状态 —— 所以可以在一瞬间回出去。
+   *
+   * 它存在的意义仅仅是【别让用户干等】：agent 一旦腾出手来，真正的进展
+   * （比如派出去的活干到哪了）还是要 agent 去查才说得清楚。
+   */
+  buildProgressText(): string {
+    const job = this.current;
+    if (!job) {
+      return `我现在空闲，队列 ${this.queue.length} 条。有活直接说。`;
+    }
+    const secs = Math.round((Date.now() - job.queuedAt) / 1000);
+    const mins = Math.floor(secs / 60);
+    const took = mins > 0 ? `${mins} 分 ${secs % 60} 秒` : `${secs} 秒`;
+    const brief = job.inbound.text.replace(/\s+/g, " ").trim().slice(0, 60);
+
+    const lines = [
+      `⏳ 我正忙：${job.inbound.label}`,
+      `任务：${brief}${job.inbound.text.length > 60 ? "…" : ""}`,
+      `已跑：${took}，${this.toolCount} 个工具调用`,
+    ];
+    if (this.queue.length > 0) {
+      const who = this.queue.map((q) => q.inbound.label).slice(0, 3).join("、");
+      lines.push(`队列：还有 ${this.queue.length} 条在等（${who}${this.queue.length > 3 ? "…" : ""}）`);
+    }
+    lines.push("");
+    lines.push("处理完就回你。要我停下就说 /stop。");
+    return lines.join("\n");
+  }
 }
 
 /* ------------------------------------------------------------------ */
 /* 辅助                                                                */
 /* ------------------------------------------------------------------ */
+
+/**
+ * IM 侧「整句就是一句状态问话」的识别。
+ *
+ * 与 triggers.ts 的区别（容易搞混，特意写清楚）：
+ *  - triggers.ts 管的是 **pi 本地对话框** 里的输入，命中了也只弹本地通知；
+ *  - 这里管的是 **IM 消息**，命中后把回复直接发回聊天窗口。
+ *
+ * 两边都坚持「整句精确匹配」，理由是同一个：用包含匹配会把
+ * 「机器人状态怎么同步到云端」「进度条怎么调」这类正常提问也劫持掉。
+ */
+export type ImQuickQuery = "status" | "progress";
+
+/** 纯机械的状态询问：任何时刻都能就地答。 */
+const QUICK_STATUS_WORDS = new Set([
+  "状态",
+  "im状态",
+  "im连接状态",
+  "机器人状态",
+  "连接状态",
+  "是否在线",
+  "在线吗",
+  "在不在",
+  "im在线吗",
+  "机器人在线吗",
+  "机器人在不在",
+  "活着吗",
+  "还活着吗",
+  "掉线了吗",
+]);
+
+/** 问进展：只在 agent 忙时拦截（空闲时放行，让 agent 去查真实进展）。 */
+const QUICK_PROGRESS_WORDS = new Set([
+  "进度",
+  "在干什么",
+  "在干什么呢",
+  "在忙什么",
+  "在忙什么呀",
+  "忙完了吗",
+  "忙完了没",
+  "干完了吗",
+  "干完了没",
+  "做完了吗",
+  "工作到哪一步了",
+  "进行到哪一步了",
+]);
+
+/** 归一化后的长度上限：超过这个长度就不可能是「一句纯指令」。 */
+const MAX_QUICK_QUERY_LENGTH = 16;
+
+export function matchImQuickQuery(text: string): ImQuickQuery | undefined {
+  if (typeof text !== "string") return undefined;
+  const normalized = normalizeTrigger(text);
+  if (!normalized || normalized.length > MAX_QUICK_QUERY_LENGTH) return undefined;
+  if (QUICK_STATUS_WORDS.has(normalized)) return "status";
+  if (QUICK_PROGRESS_WORDS.has(normalized)) return "progress";
+  return undefined;
+}
 
 export function parseCommand(text: string): { name: string; args: string } | undefined {
   const trimmed = text.trim();

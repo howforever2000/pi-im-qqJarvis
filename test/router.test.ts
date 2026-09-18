@@ -236,6 +236,74 @@ test("/status 返回通道与会话信息", async () => {
   assert.ok(text.includes("test/model"));
 });
 
+/* ------------------------------------------------------------------ */
+/* IM 侧裸短语状态入口                                                  */
+/*                                                                     */
+/* 背景（真实踩到）：IM 消息只有 `/` 开头的才走命令快通道，裸短语一律排队 */
+/* 等 agent。而 agent 一旦卡在长任务里（派活、跑构建、验收），一句       */
+/* 「是否在线」要等好几分钟 —— 用户体感就是「机器人失联」。           */
+/* ------------------------------------------------------------------ */
+
+test("忙时发「是否在线」这类裸短语也能秒回，不排进队列", async () => {
+  for (const phrase of ["是否在线", "im状态", "机器人状态", "在线吗", "是否在线？"]) {
+    const h = makeHarness();
+    h.setIdle(false); // agent 正忙
+    await h.router.accept(h.inbound({ text: phrase }));
+
+    assert.equal(h.injected.length, 0, `「${phrase}」不该被注入给 agent`);
+    assert.equal(h.channel.sent.length, 1, `「${phrase}」应当立刻回一条`);
+    assert.ok(h.channel.sent[0]?.text.includes("pi-im-relay 状态"), `「${phrase}」回的应当是状态`);
+  }
+});
+
+test("空闲时发状态裸短语，同样就地回、不耗 agent", async () => {
+  const h = makeHarness();
+  await h.router.accept(h.inbound({ text: "机器人状态" }));
+  assert.equal(h.injected.length, 0);
+  assert.equal(h.channel.sent.length, 1);
+});
+
+test("空闲时问「进度」应当放行给 agent（它能去查真实进展）", async () => {
+  const h = makeHarness();
+  await h.router.accept(h.inbound({ text: "进度" }));
+  assert.equal(h.injected.length, 1, "空闲时这类问题该由 agent 答，不该用兜底文案顶掉");
+  assert.equal(h.channel.sent.length, 0);
+});
+
+test("忙时问「在干什么」就地回一句进展，不让用户干等", async () => {
+  const h = makeHarness();
+  await h.router.accept(h.inbound({ text: "你好" }));
+  assert.equal(h.injected.length, 1);
+
+  await h.router.accept(h.inbound({ text: "在干什么" }));
+  assert.equal(h.injected.length, 1, "第二条不该被注入");
+  const text = h.channel.sent[0]?.text ?? "";
+  assert.ok(text.includes("我正忙"), `实际：${text}`);
+  assert.ok(text.includes("/stop"), "应当告诉用户怎么打断");
+});
+
+test("正常提问不会被裸短语劫持（这是最要紧的一条）", async () => {
+  const cases = [
+    "机器人状态怎么同步到云端",
+    "进度条组件怎么调样式",
+    "帮我看看 im状态 这个字段在哪定义的",
+    "在线吗，帮我把那个 bug 修了",
+  ];
+  for (const text of cases) {
+    const h = makeHarness();
+    await h.router.accept(h.inbound({ text }));
+    assert.equal(h.channel.sent.length, 0, `「${text}」被误当成状态指令劫持了`);
+    assert.equal(h.injected.length, 1, `「${text}」应当正常交给 agent`);
+  }
+});
+
+test("带斜杠的命令仍然优先于裸短语识别", async () => {
+  const h = makeHarness();
+  await h.router.accept(h.inbound({ text: "/status" }));
+  assert.equal(h.injected.length, 0);
+  assert.equal(h.channel.sent.length, 1);
+});
+
 test("/whoami 回显标识，便于加入白名单", async () => {
   const h = makeHarness();
   await h.router.accept(h.inbound({ text: "/whoami", senderId: "1001" }));
