@@ -28,6 +28,7 @@
  *   node cbc.mjs --fg "..."                     # 前台等它干完（老行为，会阻塞）
  *   node cbc.mjs --status                       # 看所有派出去的活现在什么状态
  *   node cbc.mjs --result <id>                  # 取某个活的结论（干完才有）
+ *   node cbc.mjs --stop <id>                    # 终止某条活（记中断状态，不再挂守护）
  *   node cbc.mjs --notify "..."                 # 派活 + 挂守护：干完主动推 QQ 通知
  *   node cbc.mjs --watch <id>                   # 给已派出去的活补挂守护
  *   node cbc.mjs --write "..."                  # acceptEdits（默认是 plan，只读）
@@ -35,6 +36,10 @@
  *   node cbc.mjs -C <目录> "..."                 # 指定工作目录
  *   node cbc.mjs -w "..."                       # 在独立 git worktree 里干
  *   node cbc.mjs -r <sessionId> "接着说"         # 续上一个会话
+ *
+ * 关于 --stop：派活有入口、收活也得有。它会去 `~/.codebuddy/jobs/<id>/broker.json`
+ * 读 pid、杀掉整棵进程树，并把记录标成 `stopped`（不再显示成永远 working）。
+ * 只动**我们自己**的记录，不写 WorkBuddy 的 job 目录 —— 那是它的地盘，改坏了得不偿失。
  *
  * 关于权限模式（实测）：plan 会把 Bash 一起挡掉 —— 只适合纯读代码的场景，
  * 连 `git status` 都跑不了。要它能跑命令就得 acceptEdits 起步，要它真的改代码
@@ -52,6 +57,9 @@ const CLI_ENTRY = path.join(CLI_DIR, "bin", "codebuddy");
 
 /** 派活记录落在哪 —— 放在 relay 的 tmp 下，跟着它的生命周期走。 */
 const STATE_DIR = "D:\\YUAN HAO\\Documents\\.pi\\agent\\im-relay\\tmp\\cbc-tasks";
+
+/** WorkBuddy CLI 自己的 job 目录（只读，用来找 pid）。 */
+const JOBS_DIR = path.join(os.homedir(), ".codebuddy", "jobs");
 
 /** 通知发到哪个 QQ（从 relay 配置的号主白名单里取，取不到就退回这个）。 */
 const FALLBACK_UIN = "1279717885";
@@ -252,9 +260,14 @@ async function cmdStatus() {
   console.log("-".repeat(90));
   for (const rec of rows) {
     const job = live.find((j) => j.id === rec.id);
-    const state = job?.state ?? rec.state ?? "?";
+    // 我们自己标过 stopped 的活，就不再信实时列表 —— 进程被杀后
+    // WorkBuddy 的 job 目录可能还挂着 working，那样会永远显示成在跑。
+    const state = rec.state === "stopped" ? "stopped" : (job?.state ?? rec.state ?? "?");
     const secs = Math.round((Date.now() - rec.startedAt) / 1000);
-    const took = state === "done" || state === "failed" ? `${Math.round((rec.finishedAt ?? Date.now()) / 1000 - rec.startedAt / 1000)}s` : `${secs}s`;
+    const ended = state === "done" || state === "failed" || state === "stopped";
+    const took = ended
+      ? `${Math.round((rec.finishedAt ?? Date.now()) / 1000 - rec.startedAt / 1000)}s`
+      : `${secs}s`;
     const brief = rec.prompt.replace(/\s+/g, " ").slice(0, 46);
     console.log(`${rec.id.padEnd(10)}${String(state).padEnd(10)}${took.padEnd(10)}${brief}`);
   }
@@ -288,6 +301,89 @@ function cmdResult(id) {
   console.log(`【${id} · ${state} · 耗时 ${Math.round(((rec.finishedAt ?? Date.now()) - rec.startedAt) / 1000)} 秒】`);
   console.log();
   console.log(text ?? "(转录里没找到结论)");
+}
+
+/** 从 WorkBuddy 的 job 目录里读 broker 进程号（只读）。 */
+function brokerPid(id) {
+  try {
+    const raw = fs.readFileSync(path.join(JOBS_DIR, id, "broker.json"), "utf8");
+    const pid = JSON.parse(raw)?.pid;
+    return typeof pid === "number" ? pid : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** 杀整棵进程树。Windows 用 taskkill /T（不走 shell，否则会撞上 Git Bash 的路径改写）。 */
+function killTree(pid) {
+  try {
+    if (process.platform === "win32") {
+      const r = spawnSync("taskkill", ["/T", "/F", "/PID", String(pid)], {
+        encoding: "utf8",
+        windowsHide: true,
+      });
+      return {
+        ok: r.status === 0 || !isAlive(pid),
+        why: (r.stderr || r.stdout || `taskkill 退出码 ${r.status}`).trim(),
+      };
+    }
+    process.kill(pid, "SIGTERM");
+    return { ok: true, why: "" };
+  } catch (error) {
+    return { ok: !isAlive(pid), why: error.message };
+  }
+}
+
+/**
+ * 终止一条后台活。
+ *
+ * 派活有入口，收活也得有 —— 否则用户说「结束它」时只剩手动杀进程，
+ * 而且杀完记录还挂着 running，`--status` 会永远显示成在跑。
+ *
+ * 只动**我们自己**的记录，**不写 WorkBuddy 的 job 目录**：那是它的地盘，
+ * 改坏了会影响它自己的一致性，而且 CLI 的活本来就进不了桌面版 GUI。
+ */
+function cmdStop(id) {
+  if (!id) {
+    console.error("用法：node cbc.mjs --stop <id>");
+    process.exit(2);
+  }
+  const rec = readRecord(id);
+  if (!rec) {
+    console.error(`找不到记录：${id}`);
+    process.exit(1);
+  }
+
+  const pid = brokerPid(id);
+  let verdict = "进程已不在（可能早就自己结束了）";
+  if (pid && isAlive(pid)) {
+    const r = killTree(pid);
+    verdict = r.ok ? `已终止进程树（pid ${pid}）` : `终止失败：${r.why}`;
+  }
+
+  const partial = readResult(rec.sessionId);
+  rec.state = "stopped";
+  rec.finishedAt = rec.finishedAt ?? Date.now();
+  rec.stoppedAt = Date.now();
+  rec.stopReason = "调用方主动终止（cbc.mjs --stop）";
+  if (partial) rec.partialResult = String(partial).slice(0, 4000);
+  writeRecord(rec);
+
+  const secs = Math.round((rec.stoppedAt - rec.startedAt) / 1000);
+  console.log(`已结束 ${id}（共跑了 ${Math.round(secs / 60)} 分 ${secs % 60} 秒）`);
+  console.log(`  ${verdict}`);
+  console.log(`  记录已标成 stopped —— --status 不会再显示成在跑`);
+  if (partial) console.log(`  中断前的最后一个动作：${String(partial).replace(/\s+/g, " ").trim().slice(0, 140)}`);
+  console.log(`  全过程转录（没丢）：~/.codebuddy/projects/<项目>/${rec.sessionId}.jsonl`);
 }
 
 /**
@@ -345,6 +441,11 @@ async function watchLoop(id) {
     } catch (error) {
       say(`查询失败（下轮重试）：${error.message}`);
     }
+    // 被 --stop 终止过：守护没必要再守，安静退出
+    if (readRecord(id)?.state === "stopped" || state === "stopped") {
+      say("检测到该活已被 --stop 终止，守护退出");
+      return;
+    }
     if (state === "done" || state === "failed") {
       const secs = Math.round((Date.now() - rec.startedAt) / 1000);
       rec.state = state;
@@ -400,6 +501,7 @@ async function main() {
     const a = argv[i];
     if (a === "--status") return cmdStatus();
     if (a === "--result") return cmdResult(need(i++, a));
+    if (a === "--stop" || a === "--kill") return cmdStop(need(i++, a));
     if (a === "--notify") {
       opts.watch = true;
       continue; // 必须 continue：下面是一条 else-if 链，漏下去会被当成未知参数
