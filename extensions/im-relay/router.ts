@@ -24,6 +24,8 @@ const log = createLogger("router");
 const PROGRESS_THROTTLE_MS = 5000;
 /** 注入失败（通常是暂时没有活跃会话）时最多重试几次，每 5 秒一次 */
 const MAX_INJECT_RETRIES = 6;
+/** 同一会话的「忙时回执」最短间隔 —— 连发追问不能变成刷屏 */
+const BUSY_ACK_THROTTLE_MS = 60_000;
 
 export interface PiPort {
   /** pi 当前是否空闲（可以接受新的 prompt） */
@@ -93,6 +95,13 @@ export class ImRelayRouter {
   private lastStopReason: string | undefined;
   private toolCount = 0;
   private lastProgressAt = 0;
+  /**
+   * 「忙时回执」的节流表：conversationKey → 上次回执时间。
+   *
+   * 为什么需要节流：用户连发五条追问时，回五句「收到我在忙」就是刷屏。
+   * 一句就够 —— 它要传达的仅仅是「你的话没丢」。
+   */
+  private readonly busyAckedAt = new Map<string, number>();
   private pendingControl: { target: ChatTarget; label: string } | undefined;
   /** 最近一次发起 turn 的目标，用于本地输入镜像 */
   private lastTarget: ChatTarget | undefined;
@@ -373,7 +382,52 @@ export class ImRelayRouter {
     // 组装要垫在消息前面的上下文：相册回执（同步）+ 工作约定与主页记忆（异步、带缓存）
     const notes = await this.buildNotes(inbound);
     this.queue.push({ inbound, queuedAt: Date.now(), notes });
+
+    // 忙时自动回执。
+    //
+    // 这是被用户抱怨出来的：「回答消息不及时」 —— 发出去之后一片寂静，
+    // 不知道是没收到、还是排队、还是坏了。等真排到了（可能好几分钟后）才
+    // 收到回答，体感就是机器人失联。
+    //
+    // 关键约束：**只在「这条真的会等」的时候回**。空闲时 pump() 会立刻把它
+    // 送给 pi，再回一句「收到我在忙」就是纯噪音（而且会误导）。
+    this.ackBusy(inbound);
     this.pump();
+  }
+
+  /**
+   * 忙时给一条即时回执：零 token、零延迟，纯粹告诉用户「话收到了，只是要排队」。
+   *
+   * 两个门：
+   *  1. 只在「这条真的会等」时才回（agent 正忙 / 已有在处理的 job）；
+   *  2. 同一会话 60 秒内只回一次（连发追问不刷屏）。
+   */
+  private ackBusy(inbound: InboundMessage): void {
+    const willWait = this.current !== undefined || !this.deps.isIdle();
+    if (!willWait) return;
+
+    const last = this.busyAckedAt.get(inbound.conversationKey) ?? 0;
+    if (Date.now() - last < BUSY_ACK_THROTTLE_MS) return;
+    this.busyAckedAt.set(inbound.conversationKey, Date.now());
+
+    const job = this.current;
+    const secs = job ? Math.round((Date.now() - job.queuedAt) / 1000) : 0;
+    const mins = Math.floor(secs / 60);
+    const took = mins > 0 ? `${mins} 分 ${secs % 60} 秒` : `${secs} 秒`;
+
+    const lines = ["📥 收到，我先忙完手上这条 —— 你的消息已经排上了。", ""];
+    if (job) {
+      lines.push(`正在做：${job.inbound.label} 的那条（已跑 ${took}）`);
+    }
+    // 队列里排在它前面的条数（不含自己）
+    const ahead = Math.max(0, this.queue.length - 1);
+    lines.push(ahead > 0 ? `前面还有 ${ahead} 条在等。` : "前面没人排队，轮到你就回你。");
+    lines.push("");
+    lines.push("想现在就要个回音：/status 看状态，/queue 看队列，/stop 打断当前任务。");
+
+    void this.replyRaw(inbound.target, lines.join("\n")).catch((error) => {
+      log.debug(`忙时回执发送失败: ${errorText(error)}`);
+    });
   }
 
   /**

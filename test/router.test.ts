@@ -304,6 +304,62 @@ test("带斜杠的命令仍然优先于裸短语识别", async () => {
   assert.equal(h.channel.sent.length, 1);
 });
 
+/* ------------------------------------------------------------------ */
+/* 忙时自动回执                                                        */
+/*                                                                     */
+/* 用户的抱怨是「回答消息不及时」—— 发出去后一片寂静，根本不知道是没   */
+/* 收到、在排队、还是坏了。这一层保证：只要这条真的要等，立刻给个回音。 */
+/* ------------------------------------------------------------------ */
+
+test("忙时发普通消息会立刻收到回执，而且消息不丢（仍然进队列）", async () => {
+  const h = makeHarness();
+  await h.router.accept(h.inbound({ text: "第一条" }));
+
+  await h.router.accept(h.inbound({ text: "帮我改个东西" }));
+  await sleep(30); // 回执是 fire-and-forget，给它一点时间落库
+
+  assert.equal(h.injected.length, 1, "第二条不该被立刻注入（agent 还在忙）");
+  assert.equal(h.router.queueLength(), 1, "第二条必须留在队列里，不能被回执顶掉");
+  const ack = h.channel.sent[0]?.text ?? "";
+  assert.ok(ack.includes("收到"), `实际回执：${ack}`);
+  assert.ok(ack.includes("/stop"), "应当告诉用户怎么打断");
+});
+
+test("空闲时不发忙时回执（那是纯噪音，而且会误导）", async () => {
+  const h = makeHarness();
+  await h.router.accept(h.inbound({ text: "你好" }));
+  await sleep(30);
+  assert.equal(h.injected.length, 1);
+  assert.equal(h.channel.sent.length, 0, "空闲时应当招呼都不打就直接干活");
+});
+
+test("忙时连发多条只回一次执（不刷屏）", async () => {
+  const h = makeHarness();
+  await h.router.accept(h.inbound({ text: "第一条" }));
+
+  for (const text of ["追问一", "追问二", "追问三"]) {
+    await h.router.accept(h.inbound({ text }));
+  }
+  await sleep(30);
+
+  assert.equal(h.channel.sent.length, 1, `应当只回一条回执，实际 ${h.channel.sent.length} 条`);
+  assert.equal(h.router.queueLength(), 3, "三条追问都要在队列里");
+});
+
+test("回执说过的话要兑现：前一条处理完后，排队的那条会被处理并答复", async () => {
+  const h = makeHarness();
+  await h.router.accept(h.inbound({ text: "第一条" }));
+  await h.router.accept(h.inbound({ text: "第二条" }));
+  await sleep(30);
+
+  await h.settle("答复A");
+  await h.settle("答复B");
+
+  assert.equal(h.injected.length, 2, "排队的第二条最终必须被送给 agent");
+  assert.ok(h.channel.sent.some((s) => s.text === "答复A"));
+  assert.ok(h.channel.sent.some((s) => s.text === "答复B"));
+});
+
 test("/whoami 回显标识，便于加入白名单", async () => {
   const h = makeHarness();
   await h.router.accept(h.inbound({ text: "/whoami", senderId: "1001" }));
