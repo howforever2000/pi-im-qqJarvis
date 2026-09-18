@@ -11,6 +11,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import fs from "node:fs";
 import path from "node:path";
+import { DEFAULT_AUTO_START } from "./channels/napcat-process.ts";
 
 export function agentDir(): string {
   const fromEnv = process.env.PI_CODING_AGENT_DIR?.trim();
@@ -75,6 +76,13 @@ export interface QqConfig {
    * 关掉它就恢复成老行为（已登录则直接复用）。
    */
   switchAccount: import("./channels/napcat-process.ts").SwitchAccountConfig;
+  /**
+   * 「说一句 QQ登录 就把 NapCat 拉起来」：WebUI 不可达时自动执行启动脚本。
+   *
+   * 为什么和 switchAccount 分开：重启机器之后 NapCat 是关着的，这时用户要的只是
+   * 「把码给我」，不是「换号」；反过来只想换号不想被自动启动打扰也是合理的。
+   */
+  autoStart: import("./channels/napcat-process.ts").AutoStartConfig;
 }
 
 export interface WechatConfig {
@@ -283,6 +291,7 @@ export const DEFAULT_CONFIG: ImRelayConfig = {
         restartDelayMs: 4000,
         bootTimeoutMs: 60_000,
       },
+      autoStart: { ...DEFAULT_AUTO_START },
     },
     wechat: {
       enabled: false,

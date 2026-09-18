@@ -1,5 +1,11 @@
 /**
- * NapCat 进程与账号切换。
+ * NapCat 进程、自动启动与账号切换。
+ *
+ * 两件事放一起，是因为它们操作的是同一批东西（QQ.exe / NapCatWinBootMain.exe / 启动脚本）：
+ *   1. **自动启动**：NapCat 经常是关着的（重启机器之后尤其如此）。以前这种时候用户
+ *      拿到的是 `fetch failed`，还得自己想起来去双击启动脚本。现在说一句「QQ登录」
+ *      就把它拉起来（`ensureNapcatRunning()`）。
+ *   2. **换号**：发出「QQ登录」就默认把之前那个 QQ 踢下来，换新的登录。
  *
  * 背景：用户要求「发出『QQ登录』就默认把之前那个 QQ 踢下来，换新的登录」。
  *
@@ -50,6 +56,46 @@ export const DEFAULT_SWITCH_ACCOUNT: SwitchAccountConfig = {
   restartDelayMs: 4000,
   bootTimeoutMs: 60_000,
 };
+
+/**
+ * 「说一句 QQ登录 就把 NapCat 拉起来」的配置。
+ *
+ * 为什么要独立于 switchAccount：换号是「踢掉旧账号」，自动启动是「把没跑的程序跑起来」，
+ * 两件事的开关必须分开 —— 想换号但不想被自动启动打扰（或者反过来）都是合理需求。
+ */
+export interface AutoStartConfig {
+  /** 关掉之后恢复老行为：WebUI 不可达就直接报错，让用户自己开 NapCat */
+  enabled: boolean;
+  /** NapCat.Shell 目录；留空则跟随 switchAccount.shellDir */
+  shellDir: string;
+  /** 启动脚本；留空用 <shellDir>/launcher.bat。可指向自己的包装脚本（如 D:/NapCat/start-napcat.bat） */
+  launchScript: string;
+  /** 启动前是否清掉残留的 NapCat 宿主进程（只杀 NapCat 拉起来的 QQ.exe，不动你自己开的 QQ） */
+  killStale: boolean;
+  /** 启动后等 WebUI 就绪的超时（毫秒） */
+  bootTimeoutMs: number;
+}
+
+export const DEFAULT_AUTO_START: AutoStartConfig = {
+  enabled: true,
+  shellDir: "",
+  launchScript: "",
+  killStale: true,
+  bootTimeoutMs: 90_000,
+};
+
+export interface EnsureOutcome {
+  /** 是否真的尝试过启动 NapCat（已经在跑 / 功能关着时为 false） */
+  attempted: boolean;
+  /** ok=true 表示「WebUI 现在应该可用」，调用方可以继续往下走（哪怕什么都没做） */
+  ok: boolean;
+  /** 本次是否是新启动起来的 */
+  started: boolean;
+  /** 给人看的结论（成功、超时原因、或为什么没启动） */
+  detail: string;
+  /** 实际使用的启动脚本 */
+  script?: string;
+}
 
 export interface SwitchOutcome {
   ok: boolean;
@@ -151,32 +197,218 @@ export function probePort(host: string, port: number, timeoutMs = 1500): Promise
   });
 }
 
+/** 解析「自动启动」配置：shellDir 留空时跟随换号配置，再兜底到默认安装目录。 */
+export function resolveAutoStart(config: AutoStartConfig | undefined, fallbackShellDir?: string): AutoStartConfig {
+  const merged = { ...DEFAULT_AUTO_START, ...(config ?? {}) };
+  return {
+    ...merged,
+    shellDir: merged.shellDir?.trim() || fallbackShellDir?.trim() || DEFAULT_SWITCH_ACCOUNT.shellDir,
+  };
+}
+
+/** 算出要执行的启动脚本（可被 launchScript 覆盖成带日志/清进程的包装脚本）。 */
+export function resolveLaunchScript(config: Pick<AutoStartConfig, "shellDir" | "launchScript">): string {
+  const override = config.launchScript?.trim();
+  if (override) return override;
+  return path.join(config.shellDir, process.platform === "win32" ? "launcher.bat" : "launcher.sh");
+}
+
+/**
+ * 查一遍 QQ.exe 的命令行，只找出「被 NapCat 拉起来的」那些。
+ *
+ * 为什么不能像换号那样无脑 `taskkill /f /im QQ.exe`：QQ.exe 同时是你日常聊天用的
+ * 客户端。用户只是想扫码登录机器人，结果聊天窗口被脚本干掉，这个代价没人愿意付。
+ * NapCat 的启动方式是 `NapCatWinBootMain.exe QQ.exe NapCatWinBootHook.dll …`，
+ * 命令行里带着 napcat 关键字，据此就能区分开。
+ *
+ * 读不到命令行时（权限不足 / powershell 不可用）**宁可不杀**：返回 unknown 让调用方
+ * 决定要不要提示用户。
+ */
+function findNapcatHostedQq(): { pids: number[]; unknown: number } {
+  const out: { pids: number[]; unknown: number } = { pids: [], unknown: 0 };
+  try {
+    const r = spawnSync(
+      "powershell.exe",
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "Get-CimInstance Win32_Process -Filter \"Name='QQ.exe'\" | ForEach-Object { \"$($_.ProcessId)|$($_.CommandLine)\" }",
+      ],
+      { encoding: "utf8", windowsHide: true, timeout: 20_000 },
+    );
+    if (r.status !== 0 || !r.stdout) return out;
+    for (const line of r.stdout.split(/\r?\n/)) {
+      const [pidText, ...rest] = line.trim().split("|");
+      const pid = Number(pidText);
+      if (!Number.isFinite(pid) || pid <= 0) continue;
+      const cmdline = rest.join("|");
+      if (!cmdline.trim()) out.unknown += 1;
+      else if (/napcat/i.test(cmdline)) out.pids.push(pid);
+    }
+    return out;
+  } catch (error) {
+    log.debug(`枚举 QQ.exe 命令行失败：${errorText(error)}`);
+    return out;
+  }
+}
+
+/**
+ * 清掉残留的 NapCat 宿主进程。
+ *
+ * 为什么需要：QQ 客户端把登录票据存在本地，残留的 QQ.exe 会带着旧会话起来，
+ * NapCat 报「当前账号已登录，无法重复登录」然后永远卡在等二维码（README 里的坑一）。
+ * 只杀 NapCat 自己拉起来的那一份，用户日常用的 QQ 不动。
+ */
+export function killStaleNapcatHosts(): { killed: number; skipped: number } {
+  if (processControlDisabled()) {
+    log.warn("PI_IM_RELAY_NO_PROCESS_CONTROL=1：跳过清理残留进程（干跑）");
+    return { killed: 0, skipped: 0 };
+  }
+
+  // NapCatWinBootMain 一定是 NapCat 的，直接杀
+  const boot = spawnSync("taskkill", ["/f", "/im", "NapCatWinBootMain.exe"], {
+    encoding: "utf8",
+    windowsHide: true,
+    timeout: 20_000,
+  });
+  let killed = (`${boot.stdout ?? ""}${boot.stderr ?? ""}`.match(/PID/gi) ?? []).length;
+
+  const hosted = findNapcatHostedQq();
+  for (const pid of hosted.pids) {
+    const r = spawnSync("taskkill", ["/f", "/pid", String(pid)], {
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: 20_000,
+    });
+    if (r.status === 0) killed += 1;
+    else log.debug(`taskkill /pid ${pid} 失败：${(r.stderr ?? "").trim()}`);
+  }
+  if (hosted.unknown > 0) {
+    log.warn(`有 ${hosted.unknown} 个 QQ.exe 读不到命令行，保守起见没有杀（可能是你自己开的 QQ）`);
+  }
+  log.info(`残留进程清理：杀掉 ${killed} 个（NapCat 宿主的 QQ.exe ${hosted.pids.length} 个）`);
+  return { killed, skipped: hosted.unknown };
+}
+
 /** 重新拉起 NapCat（不带 UIN，走二维码登录）。 */
-function relaunch(config: SwitchAccountConfig): { ok: boolean; detail: string } {
+function relaunch(config: SwitchAccountConfig, launchScript?: string): { ok: boolean; detail: string } {
+  return launchNapcat({ shellDir: config.shellDir, launchScript: launchScript ?? "" });
+}
+
+/** 执行启动脚本。干跑开关打开时只记录不执行（单测用）。 */
+export function launchNapcat(config: Pick<AutoStartConfig, "shellDir" | "launchScript">): {
+  ok: boolean;
+  detail: string;
+  script: string;
+} {
   const shellDir = config.shellDir;
-  const launcher = path.join(shellDir, process.platform === "win32" ? "launcher.bat" : "launcher.sh");
-  if (!fs.existsSync(shellDir)) return { ok: false, detail: `NapCat 目录不存在：${shellDir}` };
-  if (!fs.existsSync(launcher)) return { ok: false, detail: `启动脚本不存在：${launcher}` };
+  const script = resolveLaunchScript(config);
+  if (!shellDir || !fs.existsSync(shellDir)) {
+    return { ok: false, detail: `NapCat 目录不存在：${shellDir || "(未配置)"}`, script };
+  }
+  if (!fs.existsSync(script)) return { ok: false, detail: `启动脚本不存在：${script}`, script };
+
+  if (processControlDisabled()) {
+    log.warn("PI_IM_RELAY_NO_PROCESS_CONTROL=1：跳过拉起 NapCat（干跑）");
+    return { ok: true, detail: `干跑：本应拉起 ${script}`, script };
+  }
 
   try {
-    if (process.platform === "win32" && !processControlDisabled()) {
-      const child = spawn("cmd.exe", ["/c", launcher], {
+    if (process.platform === "win32") {
+      const child = spawn("cmd.exe", ["/c", script], {
         cwd: shellDir,
         detached: true,
         stdio: "ignore",
         windowsHide: true,
       });
       child.unref();
-    } else if (!processControlDisabled()) {
-      const child = spawn("bash", [launcher], { cwd: shellDir, detached: true, stdio: "ignore" });
-      child.unref();
     } else {
-      log.warn("PI_IM_RELAY_NO_PROCESS_CONTROL=1：跳过拉起 NapCat（干跑）");
+      const child = spawn("bash", [script], { cwd: shellDir, detached: true, stdio: "ignore" });
+      child.unref();
     }
-    return { ok: true, detail: `已重新拉起 ${launcher}${processControlDisabled() ? "（干跑，未真的拉起）" : ""}` };
+    return { ok: true, detail: `已拉起 ${script}`, script };
   } catch (error) {
-    return { ok: false, detail: `拉起 NapCat 失败：${errorText(error)}` };
+    return { ok: false, detail: `拉起 NapCat 失败：${errorText(error)}`, script };
   }
+}
+
+/** 轮询等 WebUI 端口就绪。 */
+export async function waitWebuiReady(
+  host: string,
+  port: number,
+  timeoutMs: number,
+  intervalMs = 1500,
+): Promise<boolean> {
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+  for (;;) {
+    if (await probePort(host, port)) return true;
+    if (Date.now() >= deadline) return false;
+    await sleep(intervalMs);
+  }
+}
+
+/**
+ * 「确保 NapCat 在跑」—— 登录链路的前置步骤。
+ *
+ * 返回语义（调用方只需要看两个字段）：
+ *   - `ok=false` → 我们确实试着启动了但失败了，把 detail 直接当结论报给用户；
+ *   - `attempted=true && ok=true` → 刚刚启动成功，NapCat 是新进程，旧凭证/旧二维码都失效了；
+ *   - `attempted=false` → 本来就跑着（或功能关着），按老路走。
+ */
+export async function ensureNapcatRunning(
+  config: AutoStartConfig,
+  options: { host: string; port: number; reason?: string },
+): Promise<EnsureOutcome> {
+  const why = options.reason ?? "登录";
+  log.info(`检查 NapCat 是否在运行（原因：${why}，WebUI ${options.host}:${options.port}）`);
+
+  if (await probePort(options.host, options.port)) {
+    const detail = "NapCat WebUI 已在运行，无需启动";
+    log.info(detail);
+    return { attempted: false, ok: true, started: false, detail };
+  }
+
+  if (!config.enabled) {
+    const detail = "NapCat 没在运行，且自动启动已关闭（qq.autoStart.enabled = false）";
+    log.info(detail);
+    return { attempted: false, ok: true, started: false, detail };
+  }
+
+  const resolved = resolveAutoStart(config);
+  const script = resolveLaunchScript(resolved);
+  if (!fs.existsSync(resolved.shellDir)) {
+    const detail = `NapCat 没在运行，也找不到它的安装目录：${resolved.shellDir}。请检查 qq.autoStart.shellDir（或 qq.switchAccount.shellDir）配置。`;
+    log.warn(detail);
+    return { attempted: true, ok: false, started: false, detail, script };
+  }
+  if (!fs.existsSync(script)) {
+    const detail = `NapCat 没在运行，启动脚本也不存在：${script}。请检查 qq.autoStart.launchScript 配置。`;
+    log.warn(detail);
+    return { attempted: true, ok: false, started: false, detail, script };
+  }
+
+  if (resolved.killStale) killStaleNapcatHosts();
+
+  const launched = launchNapcat(resolved);
+  if (!launched.ok) {
+    log.warn(launched.detail);
+    return { attempted: true, ok: false, started: false, detail: launched.detail, script };
+  }
+
+  const ready = await waitWebuiReady(options.host, options.port, resolved.bootTimeoutMs);
+  if (!ready) {
+    const detail =
+      `已尝试启动 NapCat（${script}），但 ${Math.round(resolved.bootTimeoutMs / 1000)}s 内 WebUI ` +
+      `（${options.host}:${options.port}）仍未就绪。请手动启动一次看它报什么错` +
+      "（常见原因：启动脚本需要管理员权限，或 NapCat 的 WebUI 端口被改过）。";
+    log.warn(detail);
+    return { attempted: true, ok: false, started: false, detail, script };
+  }
+
+  const detail = `NapCat 启动成功（${script}），WebUI 已就绪（${options.host}:${options.port}）`;
+  log.info(detail);
+  return { attempted: true, ok: true, started: true, detail, script };
 }
 
 /**
@@ -225,19 +457,15 @@ export async function switchQqAccount(
   }
 
   // 等 WebUI 起来 —— 它起来才说明 NapCat 真的在跑，才能取二维码
-  const deadline = Date.now() + config.bootTimeoutMs;
-  while (Date.now() < deadline) {
-    if (await probePort(options.webuiHost, options.webuiPort)) {
-      log.info(`NapCat WebUI 已就绪（${options.webuiHost}:${options.webuiPort}）`);
-      return {
-        ok: true,
-        detail: `已踢掉旧账号并重启 NapCat（清理 ${cleared.length} 项，备份于 ${backupDir ?? "无"}）`,
-        cleared,
-        killed,
-        backupDir,
-      };
-    }
-    await sleep(1500);
+  if (await waitWebuiReady(options.webuiHost, options.webuiPort, config.bootTimeoutMs)) {
+    log.info(`NapCat WebUI 已就绪（${options.webuiHost}:${options.webuiPort}）`);
+    return {
+      ok: true,
+      detail: `已踢掉旧账号并重启 NapCat（清理 ${cleared.length} 项，备份于 ${backupDir ?? "无"}）`,
+      cleared,
+      killed,
+      backupDir,
+    };
   }
 
   return {

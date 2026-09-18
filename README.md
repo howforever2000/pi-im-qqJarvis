@@ -146,6 +146,26 @@ QQ登录
 
 > 二维码约 2 分钟过期。过期后再说一次「QQ登录」就会重新出码。
 
+**NapCat 没开着怎么办？** 不用你管 —— 说「QQ登录」时会先探测 WebUI，发现没在跑就按
+`qq.autoStart` 把 `NapCat.Shell\launcher.bat` 执行起来，等它就绪再出码：
+
+```
+正在确认 NapCat 是否在运行 …
+NapCat 已启动，正在申请登录二维码 …
+```
+
+启动脚本需要管理员权限（NapCat 本身就要提权注入 QQ），而 pi-web / 终端一般已经是以
+管理员身份运行的；如果不是，`launcher.bat` 会自己拉起 UAC 提权窗口。想自己控制启动方式
+（比如带日志、先清进程的包装脚本），把 `qq.autoStart.launchScript` 指向它即可：
+
+```jsonc
+"autoStart": {
+  "enabled": true,
+  "launchScript": "D:/NapCat/start-napcat.bat",
+  "killStale": true
+}
+```
+
 ### 3.3 开启 OneBot11 服务
 
 进 NapCat 的 WebUI（默认 `http://127.0.0.1:6099`）→ 网络配置 → 新建 **WebSocket 服务器**：
@@ -451,7 +471,7 @@ extensions/im-relay/
     ├── qq.ts               QQ 通道：事件 → InboundMessage；send → 发消息
     ├── onebot11.ts         OneBot11 WebSocket 客户端
     ├── napcat-webui.ts     NapCat WebUI 客户端（扫码登录）
-    ├── napcat-process.ts   换号：杀进程 / 清票据 / 重启
+    ├── napcat-process.ts   自动启动 / 换号：杀进程 / 清票据 / 重启
     ├── wechat.ts           微信通道：扫码登录 + 长轮询 + 发消息
     ├── ilink-client.ts     iLink HTTP 协议层
     └── ilink-types.ts      iLink 类型定义
@@ -710,7 +730,12 @@ im_relay_render_card(html, width, height)  →  PNG
 | `switchAccount.qqDataDir` | `""` | QQ 数据目录；留空自动推导 |
 | `switchAccount.backupDir` | `""` | 换号时的备份目录；留空用 NapCat 安装目录的上一级 |
 | `switchAccount.restartDelayMs` | `4000` | 杀进程后等多久再拉起 |
-| `switchAccount.bootTimeoutMs` | `60000` | 等 WebUI 就绪的超时 |
+| `switchAccount.bootTimeoutMs` | `60000` | 等 WebUI 就绪的超时（换号用） |
+| `autoStart.enabled` | `true` | WebUI 不可达时是否自动启动 NapCat |
+| `autoStart.shellDir` | `""` | NapCat.Shell 目录；留空跟随 `switchAccount.shellDir` |
+| `autoStart.launchScript` | `""` | 启动脚本；留空用 `<shellDir>/launcher.bat` |
+| `autoStart.killStale` | `true` | 启动前清残留宿主进程（只杀 NapCat 拉起的 QQ.exe，不动你自己开的 QQ） |
+| `autoStart.bootTimeoutMs` | `90000` | 启动后等 WebUI 就绪的超时 |
 
 ### 微信通道 `channels.wechat`
 

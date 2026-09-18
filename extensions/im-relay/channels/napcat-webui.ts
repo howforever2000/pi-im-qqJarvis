@@ -169,6 +169,14 @@ export class NapcatWebuiClient {
     return `http://${this.options.host}:${this.options.port}`;
   }
 
+  get host(): string {
+    return this.options.host;
+  }
+
+  get port(): number {
+    return this.options.port;
+  }
+
   get hasToken(): boolean {
     return Boolean(this.options.token);
   }

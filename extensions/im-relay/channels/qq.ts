@@ -9,7 +9,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { createLogger, errorText } from "../log.ts";
 import { QQ_QR_FILE, type QqConfig } from "../config.ts";
-import { switchQqAccount } from "./napcat-process.ts";
+import { ensureNapcatRunning, resolveAutoStart, switchQqAccount, type EnsureOutcome } from "./napcat-process.ts";
 import { renderQr, type QrRender } from "../qr.ts";
 import {
   NapcatWebuiClient,
@@ -41,8 +41,26 @@ import {
 
 const log = createLogger("qq");
 const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
-/** 二维码复用窗口：这段时间内重复触发只重发，不重新申请 */
-const QR_REUSE_WINDOW_MS = 120_000;
+/**
+ * 二维码复用窗口：这段时间内重复触发只重发，不重新申请。
+ *
+ * 硬约束：**必须明显短于二维码本身的有效期**（腾讯侧约 120s）。
+ * 这里原来是 120s —— 等于「复用窗口 == 码的寿命」。后果是用户在第 110 秒说一句
+ * 「QQ登录」，扩展会很贴心地把他 110 秒前那张码原样再发一遍，而他扫到的就是
+ * 「二维码已过期」。这正是「再次扫码依然过期」的直接成因。
+ * 取 60s 保证：任何投给用户的码，至少还剩一半寿命。
+ */
+const QR_REUSE_WINDOW_MS = 60_000;
+/**
+ * 二维码硬过期线：超过这个年龄，不管 NapCat 说什么都换新码。
+ *
+ * 比复用窗口宽松，是专门留给「用户已经扫码、正在手机上按确认」的宽限期 ——
+ * 那种时候把码作废会直接打断他的确认。但真到了硬过期线，留着一张已经死掉的码
+ * 只会让 NapCat 卡死（见 refreshStaleQr），所以照样换。
+ */
+const QR_HARD_EXPIRY_MS = 115_000;
+/** 强制换码的最小重试间隔，避免 WebUI 被高频调用（它自带登录限流） */
+const QR_STALE_RETRY_MS = 15_000;
 /** 等扫码的上限 */
 const LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
 /** 登录状态轮询间隔 */
@@ -69,6 +87,15 @@ export class QqChannel implements Channel {
   private qr: QrRender | undefined;
   private qrUrl: string | undefined;
   private qrIssuedAt = 0;
+  /** 上次为「码太旧」而强制刷新 NapCat 二维码的时间，用于节流重试 */
+  private qrStaleProbeAt = 0;
+  /**
+   * 当前这张码已被判定为陈旧（换码请求发出去了，但 NapCat 还没真正吐出新的）。
+   *
+   * 这个标志存在的唯一理由是：一旦确认码废了，就不能再让下面 switch 里基于 loginPhase
+   * 的文案（比如「二维码已扫描，请在手机上确认登录」）把它覆盖掉 —— 那是 NapCat 在撒谎。
+   */
+  private qrStale = false;
   private loginController: AbortController | undefined;
   /** 正在进行的扫码确认流程（beginLogin 启动、waitForLogin 等待） */
   private loginLoop: Promise<void> | undefined;
@@ -160,6 +187,8 @@ export class QqChannel implements Channel {
     this.loginController?.abort();
     this.qr = undefined;
     this.qrUrl = undefined;
+    this.qrStaleProbeAt = 0;
+    this.qrStale = false;
     try {
       this.selfId = await (this.client?.fetchSelfId() ?? Promise.resolve(""));
     } catch (error) {
@@ -389,11 +418,29 @@ export class QqChannel implements Channel {
     }
 
     const webui = this.webuiOrThrow();
+    // 记下上一轮展示过的码：NapCat 会把它再吐回来（见下面 refresh 分支的说明）
+    const previousUrl = this.qrUrl;
     this.loginController?.abort();
     const controller = new AbortController();
     this.loginController = controller;
     this.qr = undefined;
     this.qrUrl = undefined;
+    this.qrStaleProbeAt = 0;
+    this.qrStale = false;
+    this.setState("connecting", "正在确认 NapCat 是否在运行 …");
+
+    // 用户要求：说一句「QQ登录」就该把 NapCat 拉起来，而不是甩一句 fetch failed
+    const ensured = await this.ensureNapcat(webui);
+    if (!ensured.ok) {
+      this.setState("error", ensured.detail);
+      throw new ChannelError(ensured.detail);
+    }
+    if (ensured.started) {
+      // NapCat 是新起的：上一轮的 WebUI 凭证与二维码都失效了
+      webui.reset();
+      this.setState("connecting", "NapCat 已启动，正在申请登录二维码 …");
+    }
+
     this.setState("connecting", "正在向 NapCat 申请登录二维码 …");
 
     let status: NapcatLoginStatus;
@@ -413,8 +460,9 @@ export class QqChannel implements Channel {
         this.setState("connecting", "正在踢掉当前登录的 QQ 并重启 NapCat …");
         const outcome = await switchQqAccount(this.config.switchAccount, {
           selfUin: this.selfId,
-          webuiHost: this.config.webui?.host || "127.0.0.1",
-          webuiPort: this.config.webui?.port || 6099,
+          // 用解析过后的地址（webui.host/port）：配置里留空、真值来自 webui.json 时也得对
+          webuiHost: webui.host,
+          webuiPort: webui.port,
         });
         log.info(`换号结果：${outcome.detail}`);
         if (!outcome.ok) {
@@ -425,7 +473,10 @@ export class QqChannel implements Channel {
         this.loginController?.abort();
         this.qr = undefined;
         this.qrUrl = undefined;
+        this.qrStaleProbeAt = 0;
+        this.qrStale = false;
         this.selfId = "";
+        webui.reset();
         this.setState("connecting", "NapCat 已重启，正在申请新的登录二维码 …");
         await this.start();
         try {
@@ -450,12 +501,20 @@ export class QqChannel implements Channel {
     }
 
     let url = status.qrcodeurl;
-    if (!url) {
+    // 两种情况必须强制要一张新码：
+    //  1. NapCat 没给出码；
+    //  2. 给回来的还是上一轮已经展示过的那张 —— NapCat 会卡在 qrcode_scanned（它以为码被扫了、
+    //     在等手机确认），而那张码在腾讯侧其实早已失效。此时它既不换码、也不会被别的分支刷新，
+    //     用户反复说「QQ登录」拿到的永远是同一张废码，只能手工敲 WebUI 才解得开。
+    if (!url || url === previousUrl) {
+      if (url === previousUrl) {
+        log.info("NapCat 返回的二维码与上一次相同，判定为陈旧码（疑似卡在 qrcode_scanned），强制刷新");
+      }
       const refreshed = await webui.refreshQrcode().catch(() => ({ url: "", restarting: false }));
       if (!refreshed.url && refreshed.restarting) {
         throw new ChannelError("NapCat 正在重启登录服务，请等十几秒后再发一次「QQ登录」");
       }
-      url = refreshed.url;
+      if (refreshed.url) url = refreshed.url;
     }
     if (!url) {
       try {
@@ -501,18 +560,71 @@ export class QqChannel implements Channel {
   }
 
   /**
+   * 登录前的「确保 NapCat 在跑」。
+   *
+   * 存在的理由很实际：二维码只存在于 NapCat WebUI 上，而 NapCat 经常是关着的
+   * （重启机器之后尤其如此）。以前这种时候用户拿到的是 `fetch failed`，
+   * 还得自己想起来去双击启动脚本。现在直接把道打通：启动 → 等 WebUI 就绪 → 出码。
+   */
+  private async ensureNapcat(webui: NapcatWebuiClient): Promise<EnsureOutcome> {
+    const config = resolveAutoStart(this.config.autoStart, this.config.switchAccount?.shellDir);
+    const outcome = await ensureNapcatRunning(config, {
+      host: webui.host,
+      port: webui.port,
+      reason: "QQ 扫码登录",
+    });
+    log.info(`NapCat 启动检查：${outcome.detail}`);
+    return outcome;
+  }
+
+  /**
+   * 轮询期间 NapCat 突然退出时的自救。
+   *
+   * 只在「连续多次问不到状态」且还没试过的情况下拉起一次 ——
+   * 单次失败很可能只是 WebUI 正在重启，不值得动手。
+   */
+  private async recoverNapcat(webui: NapcatWebuiClient): Promise<boolean> {
+    const config = resolveAutoStart(this.config.autoStart, this.config.switchAccount?.shellDir);
+    if (!config.enabled) return false;
+
+    this.setState("connecting", "NapCat 好像退出了，正在重新拉起 …");
+    const outcome = await ensureNapcatRunning(config, {
+      host: webui.host,
+      port: webui.port,
+      reason: "QQ 登录轮询中掉线",
+    });
+    log.info(`NapCat 掉线恢复：${outcome.detail}`);
+    if (outcome.ok) {
+      webui.reset();
+      this.setState("connecting", "NapCat 已恢复，继续等待扫码 …");
+      return true;
+    }
+    this.setState("error", outcome.detail);
+    return false;
+  }
+
+  /**
    * 轮询 NapCat 的登录状态直到扫码确认 + 核心就绪。
    *
-   * 二维码过期换码不用自己算时间：NapCat 会自己刷新，换码后 `qrcodeurl` 就变了，
-   * 这里跟着把新码投给用户即可。
+   * 换码有两条路：NapCat 自己刷新时 `qrcodeurl` 会变，跟着投新码即可；但它也可能
+   * 卡死在 `qrcode_scanned` 上永远不换（见 refreshStaleQr），所以再加一道按
+   * 「码的年龄」触发的兜底。
    */
   private async pollLogin(controller: AbortController, webui: NapcatWebuiClient): Promise<void> {
     const deadline = Date.now() + LOGIN_TIMEOUT_MS;
+    /** 连续问不到状态的次数；够多就说明 NapCat 真的不在了，而不是它自己重启了一下 */
+    let unreachable = 0;
+    let recovered = false;
 
     while (!controller.signal.aborted && Date.now() < deadline) {
       let status: NapcatLoginStatus;
       try {
         status = await webui.status();
+        // 状态请求往返期间登录流程可能已经被换掉（用户重新发起 / 通道重启）。
+        // 不在这里拦一下，这个已经作废的循环会在新流程清空 qrUrl 之后把旧码再 publish 一遍，
+        // 把新一轮刚换出来的新码盖回去。
+        if (controller.signal.aborted) break;
+        unreachable = 0;
       } catch (error) {
         if (controller.signal.aborted) break;
         // 凭证/token 这类错误重试也没用，直接报给用户
@@ -520,7 +632,13 @@ export class QqChannel implements Channel {
           this.setState("error", describeWebuiFailure(error));
           return;
         }
-        log.debug(`QQ 登录状态查询失败，稍后重试: ${errorText(error)}`);
+        unreachable += 1;
+        log.debug(`QQ 登录状态查询失败（第 ${unreachable} 次），稍后重试: ${errorText(error)}`);
+        if (unreachable >= 3 && !recovered) {
+          recovered = true;
+          if (!(await this.recoverNapcat(webui))) return;
+          unreachable = 0;
+        }
         await sleep(2000);
         continue;
       }
@@ -534,6 +652,13 @@ export class QqChannel implements Channel {
       if (status.loginError) {
         this.setState("error", `NapCat 登录出错：${status.loginError}`);
         return;
+      }
+
+      // 二维码过期兜底。这里刻意不看 loginPhase —— 正是因为 NapCat 会误报 qrcode_scanned，
+      // 才需要一个不信它的判据。请见 refreshStaleQr 的注释。
+      if (await this.refreshStaleQr(webui, status.loginPhase)) {
+        await sleep(LOGIN_POLL_MS);
+        continue;
       }
 
       switch (status.loginPhase) {
@@ -579,6 +704,80 @@ export class QqChannel implements Channel {
   }
 
   /**
+   * 二维码过期兜底：码太旧就强制向 NapCat 要一张新的。
+   *
+   * 触发线分两档（见 QR_REUSE_WINDOW_MS / QR_HARD_EXPIRY_MS）：无人扫就按复用窗口早换，
+   * 已扫码待确认则宽限到硬过期线。判定依据只看「这张码发出多久了」，不看 loginPhase。
+   *
+   * 为什么必须自己算而不信 NapCat —— 两个上游缺陷：
+   *
+   *  1. `onQRCodeSessionFailed` 里只有 `ErrType 1 / ErrCode 3`（二维码过期）会触发
+   *     「重新出码」。其他错误码（真机上实测到 Code 10、Code 1）只打一行日志，
+   *     不改 `loginPhase`、不设 `loginError`、也不换码。
+   *  2. NapCat 有已知 bug：刷新二维码接口返回成功但码根本没换
+   *     （NapNeko/NapCatQQ#1962，真机上复现过：连调两次 RefreshQRcode 拿到同一个 URL）。
+   *
+   * 叠加起来就是 NapCat 的登录状态机会卡在 `loginPhase: "qrcode_scanned"`
+   * （`qrLoginAccepted: false`）——它以为「码已被扫、正在等手机确认」，但那张码在腾讯侧
+   * 早已过期。后果是：
+   *
+   *  - 用户手机上一直提示「二维码已过期」；
+   *  - NapCat 自认为不在 waiting_qrcode，所以永远不会自己换码；
+   *  - 下面 switch 里「url 变了就投递新码」的分支也不会触发；
+   *  - 用户反复说「QQ登录」，拿到的永远是同一张废码，只能人工敲 WebUI API 才解得开。
+   *
+   * 所以这里不信 loginPhase，只问「这张码发出多久了」。返回 true 表示已经换了新码
+   * （调用方应跳过本轮 switch，否则会拿着旧 status 把状态又写回去）。
+   */
+  private async refreshStaleQr(
+    webui: NapcatWebuiClient,
+    phase: NapcatLoginPhase,
+  ): Promise<boolean> {
+    if (!this.qr || !this.qrUrl) return false;
+
+    // 已经扫码待确认的，宽限到硬过期线再换 —— 此刻换码等于把用户手上的确认打断。
+    // 其余情况（码摆在那儿没人扫）早点换掉更划算：用户可能随时去扫它。
+    const limit = phase === "qrcode_scanned" ? QR_HARD_EXPIRY_MS : QR_REUSE_WINDOW_MS;
+    if (Date.now() - this.qrIssuedAt < limit) return false;
+
+    // 节流期内：不再骚扰 NapCat，但仍要遮住 loginPhase 的文案（它可能正在撒谎）。
+    // 返回 this.qrStale 而不是 false，否则提示会在重试间隔里来回跳。
+    if (Date.now() - this.qrStaleProbeAt < QR_STALE_RETRY_MS) return this.qrStale;
+    this.qrStaleProbeAt = Date.now();
+
+    log.info("当前二维码已超过有效期，强制向 NapCat 申请新码");
+    let refreshed: { url: string; restarting: boolean };
+    try {
+      refreshed = await webui.refreshQrcode();
+    } catch (error) {
+      // 请求本身失败：保持上一次的结论，不影响接下来的轮询重试
+      log.debug(`强制刷新二维码失败: ${errorText(error)}`);
+      return this.qrStale;
+    }
+
+    if (!refreshed.url) {
+      if (refreshed.restarting) {
+        this.qrStale = true;
+        this.setState("connecting", "NapCat 正在重启登录服务，稍候会自动重新出码 …");
+        return true;
+      }
+      log.warn("NapCat 没返回新二维码，可能仍在生成");
+      return this.qrStale;
+    }
+
+    if (refreshed.url === this.qrUrl) {
+      // NapCat 声称刷新成功，但给的还是同一张。如实告诉用户，等下次重试。
+      log.warn("NapCat 刷新二维码后返回的仍是同一张码，可能仍卡在旧状态");
+      this.qrStale = true;
+      this.setState("needs-login", "二维码已过期，正在重新申请 …");
+      return true;
+    }
+
+    this.publishQr(refreshed.url, "waiting_qrcode");
+    return true;
+  }
+
+  /**
    * 新的二维码就绪：交给上层按界面能力投递（图片 / 终端 ASCII）。
    * 同时落一份文本到磁盘，方便在图片不可用的环境下拷贝链接。
    */
@@ -592,6 +791,8 @@ export class QqChannel implements Channel {
     this.qr = rendered;
     this.qrUrl = url;
     this.qrIssuedAt = Date.now();
+    this.qrStaleProbeAt = 0;
+    this.qrStale = false;
 
     void fs
       .writeFile(
@@ -663,6 +864,12 @@ function describeWebuiFailure(error: unknown): string {
   if (isAlreadyLoggedIn(error)) {
     return "NapCat 显示 QQ 已经登录，不需要扫码。若通道仍未在线，请检查 OneBot11 服务是否已开启（或执行 /im reload）。";
   }
-  if (error instanceof NapcatWebuiError) return error.message;
+  if (error instanceof NapcatWebuiError) {
+    // 走到这里说明前面那次自动启动没把 WebUI 拉起来（或功能被关了），把开关提示补上
+    if (error.kind === "unreachable") {
+      return `${error.message}（若希望发「QQ登录」时自动启动 NapCat，确认 qq.autoStart.enabled = true）`;
+    }
+    return error.message;
+  }
   return errorText(error);
 }
