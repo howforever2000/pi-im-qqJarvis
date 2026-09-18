@@ -520,7 +520,10 @@ export default function imRelay(pi: ExtensionAPI): void {
       const text = (s: string) => ({ content: [{ type: "text" as const, text: s }], details: {} });
       const h = host();
       if (!h) return text("pi-im-relay 未启动。");
-      const call = h.router.channel("qq")?.api;
+      // api 是 QqChannel 的方法，内部要用 this.client —— 必须先绑回 channel 再调用。
+      // 直接摘下来裸调用会得到 "Cannot read properties of undefined (reading 'client')"。
+      const channel = h.router.channel("qq");
+      const call = channel?.api?.bind(channel);
       if (!call) return text("QQ 通道没有协议接口（NapCat 未连接），发不了空间。");
 
       const digest = h.config.qzone.digest;
@@ -571,6 +574,7 @@ export default function imRelay(pi: ExtensionAPI): void {
     }),
     async execute(_toolCallId, params) {
       const text = (s: string) => ({ content: [{ type: "text" as const, text: s }], details: {} });
+      const h = host();
       const safe = (params.fileName ?? `card-${Date.now()}`).replace(/[\\/:*?"<>|]/g, "_").slice(0, 60);
       const workDir = path.join(DATA_DIR, "tmp", "cards");
       fs.mkdirSync(workDir, { recursive: true });
